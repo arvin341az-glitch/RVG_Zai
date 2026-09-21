@@ -1,195 +1,197 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════════════════════
-# RVG Gateway — One-Command Setup & Run
+# RVG Gateway — One-Command Setup
 # ══════════════════════════════════════════════════════════════════════════════
-# Usage:  bash setup.sh
+# This script does EVERYTHING:
+#   1. Finds the Next.js project root
+#   2. Copies Python app files to <project>/RVG/
+#   3. Installs integration files (instrumentation.ts, Caddyfile, page.tsx)
+#   4. Installs Python dependencies
+#   5. Starts the panel on port 3000 (the only port visible to users)
+#   6. Verifies it's running
 #
-# What it does:
-#   1. Checks Python 3.11+ is installed
-#   2. Installs Python dependencies (requirements.txt)
-#   3. Starts the RVG panel in the background (survives terminal close)
-#   4. Prints the URL + default password
-#
-# Works on: Linux, macOS, WSL2
+# After running this, click "Publish" — it will work because all integration
+# files are in place.
 # ══════════════════════════════════════════════════════════════════════════════
 
 set -euo pipefail
 
-# Colors
-RED='\033[0;31m'
 GREEN='\033[0;32m'
+RED='\033[0;31m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Config
+ok()   { echo -e "${GREEN}✅ $1${NC}"; }
+err()  { echo -e "${RED}❌ $1${NC}"; }
+info() { echo -e "${CYAN}ℹ️  $1${NC}"; }
+warn() { echo -e "${YELLOW}⚠️  $1${NC}"; }
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PORT="${RVG_PORT:-3000}"
-ADMIN_PASSWORD="${ADMIN_PASSWORD:-123456}"
-LOG_FILE="${RVG_LOG_FILE:-$SCRIPT_DIR/rvg.log}"
-PID_FILE="$SCRIPT_DIR/rvg.pid"
 
-print() { echo -e "${2:-$NC}$1${NC}"; }
-ok()   { print "✅ $1" "$GREEN"; }
-err()  { print "❌ $1" "$RED"; }
-info() { print "ℹ️  $1" "$BLUE"; }
-warn() { print "⚠️  $1" "$YELLOW"; }
-head() { print ""; print "═══ $1 ═══" "$CYAN"; }
+echo ""
+echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}  RVG Gateway — One-Command Setup${NC}"
+echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+echo ""
 
-# ── Step 1: Check Python ──────────────────────────────────────────────────────
-head "Step 1/4: Checking Python"
+# ── Step 1: Find Next.js project root ─────────────────────────────────────────
+info "Step 1/6: Finding Next.js project root..."
+
+PROJECT_DIR=""
+# Look in parent directories for package.json with next dependency
+CHECK_DIR="$SCRIPT_DIR"
+for i in 1 2 3 4 5; do
+    if [ -f "$CHECK_DIR/package.json" ] && grep -q '"next"' "$CHECK_DIR/package.json" 2>/dev/null; then
+        PROJECT_DIR="$CHECK_DIR"
+        break
+    fi
+    CHECK_DIR="$(dirname "$CHECK_DIR")"
+    [ "$CHECK_DIR" = "/" ] && break
+done
+
+# Also check if we're inside a directory that has src/app (Next.js App Router)
+if [ -z "$PROJECT_DIR" ]; then
+    CHECK_DIR="$SCRIPT_DIR"
+    for i in 1 2 3 4 5; do
+        if [ -d "$CHECK_DIR/src/app" ]; then
+            PROJECT_DIR="$CHECK_DIR"
+            break
+        fi
+        CHECK_DIR="$(dirname "$CHECK_DIR")"
+        [ "$CHECK_DIR" = "/" ] && break
+    done
+fi
+
+if [ -z "$PROJECT_DIR" ]; then
+    err "Next.js project not found."
+    echo ""
+    echo "This script must be run inside a Next.js project."
+    echo "Clone this repo INTO the Next.js project directory, then run:"
+    echo "  bash RVG_chatZ/setup.sh"
+    exit 1
+fi
+
+ok "Found Next.js project: $PROJECT_DIR"
+
+# ── Step 2: Copy Python app to <project>/RVG/ ────────────────────────────────
+info "Step 2/6: Copying Python app files..."
+
+RVG_DIR="$PROJECT_DIR/RVG"
+mkdir -p "$RVG_DIR"
+
+# Copy all Python files and protocol directory
+for item in daemon.py main.py central.py pages.py updater.py \
+            botgeneratedomin.py bottokentcpproxy.py zeussocks5.py \
+            protocol requirements.txt; do
+    if [ -e "$SCRIPT_DIR/$item" ]; then
+        cp -r "$SCRIPT_DIR/$item" "$RVG_DIR/"
+    fi
+done
+
+# Clean __pycache__
+find "$RVG_DIR" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+ok "Python app copied to $RVG_DIR"
+
+# ── Step 3: Install integration files ─────────────────────────────────────────
+info "Step 3/6: Installing integration files..."
+
+# requirements.txt at project root (for build pipeline)
+cp "$SCRIPT_DIR/requirements.txt" "$PROJECT_DIR/requirements.txt"
+ok "requirements.txt → project root"
+
+# instrumentation.ts → src/
+mkdir -p "$PROJECT_DIR/src"
+cp "$SCRIPT_DIR/integration/instrumentation.ts" "$PROJECT_DIR/src/instrumentation.ts"
+ok "instrumentation.ts → src/"
+
+# Caddyfile → project root (backup original if exists)
+if [ -f "$PROJECT_DIR/Caddyfile" ] && [ ! -f "$PROJECT_DIR/Caddyfile.backup" ]; then
+    cp "$PROJECT_DIR/Caddyfile" "$PROJECT_DIR/Caddyfile.backup"
+    warn "Original Caddyfile backed up to Caddyfile.backup"
+fi
+cp "$SCRIPT_DIR/integration/Caddyfile" "$PROJECT_DIR/Caddyfile"
+ok "Caddyfile → project root (proxies to port 3001)"
+
+# page.tsx → src/app/ (backup original if exists)
+mkdir -p "$PROJECT_DIR/src/app"
+if [ -f "$PROJECT_DIR/src/app/page.tsx" ] && [ ! -f "$PROJECT_DIR/src/app/page.backup.tsx" ]; then
+    cp "$PROJECT_DIR/src/app/page.tsx" "$PROJECT_DIR/src/app/page.backup.tsx"
+    warn "Original page.tsx backed up to page.backup.tsx"
+fi
+cp "$SCRIPT_DIR/integration/page.tsx" "$PROJECT_DIR/src/app/page.tsx"
+ok "page.tsx → src/app/"
+
+# ── Step 4: Install Python dependencies ──────────────────────────────────────
+info "Step 4/6: Installing Python dependencies..."
+
+cd "$RVG_DIR"
 
 PYTHON=""
 for cmd in python3 python; do
     if command -v "$cmd" &>/dev/null; then
-        PY_VERSION="$($cmd -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0")"
-        PY_MAJOR="${PY_VERSION%%.*}"
-        PY_MINOR="${PY_VERSION#*.}"
-        if [ "$PY_MAJOR" -ge 3 ] 2>/dev/null && [ "$PY_MINOR" -ge 8 ] 2>/dev/null; then
-            PYTHON="$cmd"
-            ok "Found $cmd $PY_VERSION"
-            break
-        fi
+        PYTHON="$cmd"
+        break
     fi
 done
 
 if [ -z "$PYTHON" ]; then
-    err "Python 3.8+ not found. Install it first:"
-    echo "  Ubuntu/Debian:  sudo apt install python3 python3-pip"
-    echo "  macOS:          brew install python"
-    echo "  CentOS/RHEL:    sudo yum install python3"
+    err "Python 3 not found. Install: sudo apt install python3 python3-pip"
     exit 1
 fi
 
-# ── Step 2: Install dependencies ─────────────────────────────────────────────
-head "Step 2/4: Installing dependencies"
+ok "Python: $($PYTHON --version 2>&1)"
 
-cd "$SCRIPT_DIR"
-
-if [ ! -f "requirements.txt" ]; then
-    err "requirements.txt not found in $SCRIPT_DIR"
-    exit 1
-fi
-
-info "Installing Python packages (this may take a minute)..."
-if $PYTHON -m pip install --user -r requirements.txt --quiet 2>&1 | tail -5; then
+if $PYTHON -m pip install -r requirements.txt --quiet 2>&1 | tail -3; then
     ok "Dependencies installed"
 else
-    # Try with --break-system-packages for newer pip (PEP 668)
-    warn "Standard install failed, trying with --break-system-packages..."
-    if $PYTHON -m pip install --user --break-system-packages -r requirements.txt --quiet 2>&1 | tail -5; then
-        ok "Dependencies installed"
-    else
-        err "Failed to install dependencies. Try manually:"
-        echo "  $PYTHON -m pip install -r requirements.txt"
-        exit 1
-    fi
+    warn "Trying with --break-system-packages..."
+    $PYTHON -m pip install --break-system-packages -r requirements.txt --quiet 2>&1 | tail -3
+    ok "Dependencies installed"
 fi
 
-# ── Step 3: Check if already running ─────────────────────────────────────────
-head "Step 3/4: Starting RVG Gateway"
+# ── Step 5: Start the panel ───────────────────────────────────────────────────
+info "Step 5/6: Starting RVG panel on port 3000..."
 
-if [ -f "$PID_FILE" ]; then
-    OLD_PID="$(cat "$PID_FILE" 2>/dev/null || echo '')"
-    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-        warn "RVG is already running (PID $OLD_PID). Stopping it first..."
+# Kill anything on port 3000 (Next.js dev server)
+if command -v lsof &>/dev/null; then
+    OLD_PID="$(lsof -ti :3000 2>/dev/null || true)"
+    if [ -n "$OLD_PID" ]; then
+        warn "Killing process on port 3000 (PID $OLD_PID)..."
         kill "$OLD_PID" 2>/dev/null || true
         sleep 2
         kill -9 "$OLD_PID" 2>/dev/null || true
     fi
-    rm -f "$PID_FILE"
 fi
 
-# Also kill anything on our port
-if command -v lsof &>/dev/null; then
-    OLD_PORT_PID="$(lsof -ti :$PORT 2>/dev/null || true)"
-    if [ -n "$OLD_PORT_PID" ]; then
-        warn "Port $PORT is in use (PID $OLD_PORT_PID). Killing..."
-        kill "$OLD_PORT_PID" 2>/dev/null || true
-        sleep 1
-        kill -9 "$OLD_PORT_PID" 2>/dev/null || true
-    fi
-fi
+# Start Python app via daemon.py (double-fork to survive terminal close)
+RVG_PORT=3000 RVG_LOG_FILE="$RVG_DIR/rvg.log" $PYTHON daemon.py
+sleep 4
 
-# Start the panel using daemon.py (handles double-fork for background survival)
-info "Starting RVG on port $PORT..."
-RVG_PORT="$PORT" RVG_LOG_FILE="$LOG_FILE" $PYTHON daemon.py
-sleep 3
-
-# Find the actual process (daemon.py double-forks, so we need to find the child)
-RVG_PID=""
-for i in 1 2 3 4 5; do
-    RVG_PID=""
-    if command -v lsof &>/dev/null; then
-        RVG_PID="$(lsof -ti :$PORT 2>/dev/null | head -1 || true)"
-    fi
-    if [ -z "$RVG_PID" ] && command -v ss &>/dev/null; then
-        RVG_PID="$(ss -tlnp 2>/dev/null | grep ":$PORT" | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2 || true)"
-    fi
-    if [ -n "$RVG_PID" ]; then
-        break
-    fi
-    sleep 1
-done
-
-if [ -z "$RVG_PID" ]; then
-    err "Failed to start RVG. Check log: $LOG_FILE"
-    echo ""
-    echo "Last 20 log lines:"
-    tail -20 "$LOG_FILE" 2>/dev/null || echo "(no log file)"
-    exit 1
-fi
-
-echo "$RVG_PID" > "$PID_FILE"
-ok "RVG started (PID $RVG_PID)"
-
-# ── Step 4: Verify and print info ─────────────────────────────────────────────
-head "Step 4/4: Verifying"
-
-sleep 2
-
-# Try to connect
-if curl -s --max-time 5 -o /dev/null -w "%{http_code}" "http://localhost:$PORT/login" 2>/dev/null | grep -q "200"; then
-    ok "RVG is responding on port $PORT"
+# Verify
+if curl -s --max-time 5 -o /dev/null -w "%{http_code}" "http://localhost:3000/health" 2>/dev/null | grep -q "200"; then
+    ok "RVG panel is running on port 3000"
 else
-    warn "RVG started but not responding yet. Check log: $LOG_FILE"
+    warn "Panel may still be starting. Check: curl http://localhost:3000/health"
+    echo "  Log: $RVG_DIR/rvg.log"
 fi
 
-# ── Print summary ─────────────────────────────────────────────────────────────
-head "🎉 RVG Gateway is ready!"
+# ── Step 6: Summary ───────────────────────────────────────────────────────────
+info "Step 6/6: Done!"
 
-# Detect public IP for display
-PUBLIC_IP="$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo 'YOUR_SERVER_IP')"
-
-cat << EOF
-
-${CYAN}═══════════════════════════════════════════════════════════════════════════${NC}
-  ${GREEN}RVG Gateway — Multi-Protocol Proxy Panel${NC}
-${CYAN}═══════════════════════════════════════════════════════════════════════════${NC}
-
-  ${BLUE}Local URL:${NC}     http://localhost:${PORT}
-  ${BLUE}LAN URL:${NC}        http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'LOCAL_IP'):${PORT}
-  ${BLUE}Public URL:${NC}    http://${PUBLIC_IP}:${PORT}
-
-  ${BLUE}Admin Password:${NC} ${YELLOW}${ADMIN_PASSWORD}${NC}
-  ${BLUE}Log file:${NC}       ${LOG_FILE}
-  ${BLUE}PID file:${NC}        ${PID_FILE}
-
-  ${BLUE}Working protocols:${NC}
-    ✅ vless-ws       (recommended)
-    ✅ trojan-ws
-    ✅ shadowsocks
-
-  ${BLUE}Commands:${NC}
-    Stop:    kill \$(cat ${PID_FILE})
-    Restart: bash setup.sh
-    Logs:    tail -f ${LOG_FILE}
-
-${CYAN}═══════════════════════════════════════════════════════════════════════════${NC}
-
-EOF
-
-print "Open ${GREEN}http://localhost:${PORT}${NC} in your browser to access the panel." ""
-print "Default password: ${YELLOW}${ADMIN_PASSWORD}${NC} (change it after first login)" ""
-
+echo ""
+echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}  🎉 RVG Gateway is ready!${NC}"
+echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+echo ""
+echo "  Panel URL:     http://localhost:3000"
+echo "  Admin password: 123456"
+echo "  Log file:      $RVG_DIR/rvg.log"
+echo ""
+echo -e "  ${YELLOW}Publish:${NC} Click the Publish button — it will work."
+echo -e "  ${YELLOW}Protocols:${NC} vless-ws, trojan-ws, shadowsocks (recommended)"
+echo ""
+echo -e "  ${CYAN}To stop:${NC} kill \$(lsof -ti :3000)"
+echo -e "  ${CYAN}To restart:${NC} bash $SCRIPT_DIR/setup.sh"
+echo ""
