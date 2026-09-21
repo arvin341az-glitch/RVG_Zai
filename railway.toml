@@ -1,0 +1,14 @@
+# Railway deploy config for RVG Gateway
+# Deploy: https://railway.app → New Project → Deploy from GitHub → select repo
+
+[deploy]
+startCommand = "python3 daemon.py --serve"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+
+[[services]]
+name = "rvg-gateway"
+
+[services.source]
+repo = "ggabhdnfj/RVG_chatZ"
+branch = "main"
