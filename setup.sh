@@ -77,11 +77,21 @@ else
     ok "Dependencies installed"
 fi
 
-# ── 8. Start panel on port 3000 ───────────────────────────────────────────────
-info "Starting RVG on port 3000..."
+# ── 8. Start panel on port 3000 (dev) ─────────────────────────────────────────
+# DEV: Caddy is already proxying :81 → :3000 (loaded at startup, can't reload).
+#      So Python MUST run on 3000 for the preview to work.
+#      We kill Next.js (it restarts in production via build, not in dev).
+# PROD: Caddyfile (set to :3001) gets packaged into the build, so in production
+#       Caddy → :3001, and instrumentation.ts starts Python on :3001.
+info "Starting RVG on port 3000 (dev)..."
 if command -v lsof &>/dev/null; then
     OLD="$(lsof -ti :3000 2>/dev/null || true)"
-    [ -n "$OLD" ] && { warn "Killing port 3000 (PID $OLD)..."; kill "$OLD" 2>/dev/null || true; sleep 2; kill -9 "$OLD" 2>/dev/null || true; }
+    if [ -n "$OLD" ]; then
+        warn "Killing process on port 3000 (PID $OLD)..."
+        kill "$OLD" 2>/dev/null || true
+        sleep 2
+        kill -9 "$OLD" 2>/dev/null || true
+    fi
 fi
 RVG_PORT=3000 RVG_LOG_FILE="$R/rvg.log" $PY daemon.py
 sleep 4
@@ -92,12 +102,25 @@ else
     warn "Still starting. Check: curl http://localhost:3000/health"
 fi
 
+# Verify user can reach it through Caddy gateway (:81 → :3000 in dev)
+if curl -s --max-time 5 -o /dev/null -w "%{http_code}" "http://localhost:81/login" 2>/dev/null | grep -q "200"; then
+    ok "Gateway → :3000 working (preview panel ready)"
+else
+    warn "Gateway not reaching :3000. Check if Python started."
+fi
+
 echo ""
 echo -e "${C}═══════════════════════════════════════════════════════════════${N}"
 echo -e "${G}  🎉 Done! Click Publish — it will work.${N}"
 echo -e "${C}═══════════════════════════════════════════════════════════════${N}"
 echo ""
-echo "  URL:      http://localhost:3000"
+echo "  Preview:  via Preview Panel (right side)"
+echo "  Local:    http://localhost:3000"
 echo "  Password: 123456"
 echo "  Log:      $R/rvg.log"
+echo ""
+echo "  Architecture:"
+echo "    DEV: Python :3000 (Caddy :81 → :3000)"
+echo "    PROD: Python :3001 (instrumentation.ts), Caddy :81 → :3001"
+echo "    Publish → build packages Caddyfile + instrumentation.ts → works"
 echo ""
