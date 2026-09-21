@@ -490,29 +490,54 @@ def serve():
     - sandbox: after double-fork
     - production: directly from instrumentation.ts via `python3 daemon.py --serve`
     """
+    # Make sure /data exists (RVG tries to write state there)
+    try:
+        os.makedirs("/data", exist_ok=True)
+    except Exception:
+        pass  # Permission denied — RVG handles this gracefully
+
     os.chdir(WORK_DIR)
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
     sys.path.insert(0, WORK_DIR)
-    import main as rvg_main  # noqa: E402
-    from main import app    # noqa: E402
 
-    patch_config_generation(rvg_main)
-    add_config_endpoints(rvg_main, app)
-    app.router.redirect_slashes = False
+    try:
+        import main as rvg_main  # noqa: E402
+        from main import app    # noqa: E402
+    except Exception as e:
+        print(f"[RVG] FATAL: Failed to import main: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+    try:
+        patch_config_generation(rvg_main)
+        add_config_endpoints(rvg_main, app)
+        app.router.redirect_slashes = False
+    except Exception as e:
+        print(f"[RVG] FATAL: Failed to apply patches: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
     wrapped = TrailingSlashStripper(PublicHostRewriter(app))
 
-    import uvicorn  # noqa: E402
-    uvicorn.run(
-        wrapped,
-        host="0.0.0.0",
-        port=int(PORT),
-        log_level="info",
-        workers=1,
-        loop="auto",
-        http="auto",
-    )
+    try:
+        import uvicorn  # noqa: E402
+        uvicorn.run(
+            wrapped,
+            host="0.0.0.0",
+            port=int(PORT),
+            log_level="info",
+            workers=1,
+            loop="asyncio",  # Don't require uvloop (might not be installed)
+            http="auto",
+        )
+    except Exception as e:
+        print(f"[RVG] FATAL: uvicorn failed: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 # ── main() — sandbox entry with double-fork ───────────────────────────────────
