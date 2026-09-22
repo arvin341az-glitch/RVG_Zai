@@ -22,12 +22,16 @@ Usage:
 import os
 import sys
 import json
+import time
 import base64
+import socket
+import subprocess
 from urllib.parse import quote
 
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.environ.get("RVG_LOG_FILE", "/home/z/my-project/rvg.log")
 PORT = os.environ.get("RVG_PORT", "3000")
+REDIS_PORT = int(os.environ.get("RVG_REDIS_PORT", "6379"))
 
 # ── Host detection ────────────────────────────────────────────────────────────
 
@@ -483,6 +487,66 @@ def add_config_endpoints(main_mod, app):
         )
 
 
+# ── Redis bootstrap (اختیاری) ─────────────────────────────────────────────────
+
+def _redis_alive(host: str = "127.0.0.1", port: int = REDIS_PORT) -> bool:
+    """PING دستی روی پروتکل Redis — بدون نیاز به redis-cli یا پکیج redis."""
+    try:
+        with socket.create_connection((host, port), timeout=1) as s:
+            s.sendall(b"*1\r\n$4\r\nPING\r\n")
+            return b"+PONG" in s.recv(16)
+    except Exception:
+        return False
+
+
+def _ensure_redis():
+    """اگر REDIS_URL از بیرون ست شده باشد (مثلاً Redis افزونه‌ی Railway) از همان
+    استفاده می‌شود. وگرنه سعی می‌کند یک Redis محلی را با باینری همراه ریپو
+    (redis-bin/ یا RVG/bin/) بالا بیاورد — با AOF (appendonly) تا state بین
+    ری‌استارت‌ها ماندگار بماند. اگر هیچ‌کدام نشد، پنل روی فایل محلی (DATA_DIR
+    هوشمند) کار می‌کند و هیچ‌چیز نمی‌شکند."""
+    if os.environ.get("REDIS_URL", "").strip():
+        print("[RVG] REDIS_URL از محیط ست شده — از Redis خارجی استفاده می‌شود.", file=sys.stderr)
+        return
+    if _redis_alive():
+        os.environ["REDIS_URL"] = f"redis://127.0.0.1:{REDIS_PORT}/0"
+        print(f"[RVG] Redis محلی روی پورت {REDIS_PORT} از قبل در حال اجراست — استفاده می‌شود.", file=sys.stderr)
+        return
+    candidates = [
+        os.path.join(WORK_DIR, "bin", "redis-server"),          # RVG/bin (توسط setup.sh کپی می‌شود)
+        os.path.join(WORK_DIR, "..", "redis-bin", "redis-server"),  # اجرای مستقیم از داخل کلون ریپو
+        os.path.expanduser("~/.local/bin/redis-server"),
+        "/usr/local/bin/redis-server",
+        "/usr/bin/redis-server",
+    ]
+    redis_bin = next((c for c in candidates if os.path.isfile(c) and os.access(c, os.X_OK)), None)
+    if not redis_bin:
+        print("[RVG] باینری Redis پیدا نشد — ذخیره‌سازی روی فایل محلی (DATA_DIR).", file=sys.stderr)
+        return
+    redis_dir = os.path.join(os.environ.get("DATA_DIR") or WORK_DIR, "redis")
+    try:
+        os.makedirs(redis_dir, exist_ok=True)
+    except Exception:
+        redis_dir = WORK_DIR
+    try:
+        logf = open(os.path.join(WORK_DIR, "redis.log"), "ab")
+        subprocess.Popen(
+            [redis_bin, "--port", str(REDIS_PORT), "--bind", "127.0.0.1",
+             "--dir", redis_dir, "--appendonly", "yes", "--appendfsync", "everysec"],
+            stdout=logf, stderr=logf, start_new_session=True,
+        )
+    except Exception as e:
+        print(f"[RVG] راه‌اندازی Redis ناموفق بود: {e} — فایل محلی.", file=sys.stderr)
+        return
+    for _ in range(40):
+        if _redis_alive():
+            os.environ["REDIS_URL"] = f"redis://127.0.0.1:{REDIS_PORT}/0"
+            print(f"[RVG] Redis محلی روی پورت {REDIS_PORT} بالا آمد — state روی Redis (AOF ماندگار).", file=sys.stderr)
+            return
+        time.sleep(0.25)
+    print("[RVG] Redis پاسخ نداد — فایل محلی.", file=sys.stderr)
+
+
 # ── serve() — shared by sandbox and production ────────────────────────────────
 
 def serve():
@@ -490,6 +554,8 @@ def serve():
     - sandbox: after double-fork
     - production: directly from instrumentation.ts via `python3 daemon.py --serve`
     """
+    _ensure_redis()
+
     # Make sure /data exists (RVG tries to write state there)
     try:
         os.makedirs("/data", exist_ok=True)

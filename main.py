@@ -132,7 +132,33 @@ async def _detect_public_host(request: Request, call_next):
             _request_host_ctx.reset(token)
 
 # ── Persistence ───────────────────────────────────────────────────────────────
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+def _pick_data_dir() -> Path:
+    """مسیر ذخیره‌سازی state — اولین مسیرِ قابل‌نوشتن برنده است:
+      1) DATA_DIR محیطی (اگر ست شده باشد)
+      2) /data (پلتفرم‌هایی مثل Railway که volume دارند)
+      3) کنار خود برنامه (RVG/data) — سندباکس‌ها و نصب‌های ساده
+      4) /tmp/rvg_data (آخرین چاره)
+    این تابع مشکل «پاک شدن دیتا روی پلتفرم‌هایی که /data ندارند» را ریشه‌ای حل می‌کند."""
+    env_dir = os.environ.get("DATA_DIR", "").strip()
+    candidates: list[Path] = []
+    if env_dir:
+        candidates.append(Path(env_dir))
+    candidates.append(Path("/data"))
+    candidates.append(Path(__file__).resolve().parent / "data")
+    candidates.append(Path("/tmp/rvg_data"))
+    for c in candidates:
+        try:
+            c.mkdir(parents=True, exist_ok=True)
+            probe = c / ".write_test"
+            probe.write_text("ok")
+            probe.unlink()
+            return c
+        except Exception:
+            continue
+    return Path("/tmp/rvg_data")
+
+
+DATA_DIR = _pick_data_dir()
 DATA_FILE = DATA_DIR / "rvg_state.json"
 SECRET_FILE = DATA_DIR / ".rvg_secret"
 SAVE_LOCK = asyncio.Lock()

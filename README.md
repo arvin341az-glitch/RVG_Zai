@@ -569,3 +569,14 @@ python main.py
 <br/>
 
 <img src="https://capsule-render.vercel.app/api?type=waving&color=0:2c5364,50:203a43,100:0f2027&height=120&section=footer" width="100%"/>
+
+---
+
+## Persistence, Redis & Keep-alive (new in setup v2)
+
+- **Persistent storage**: state (configs, sub groups, admin password hash, node keys) is stored in the first writable location: `$DATA_DIR` → `/data` → `RVG/data` → `/tmp/rvg_data`. Nothing is wiped on restarts anymore.
+- **Bundled Redis**: `redis-bin/` ships a self-contained `redis-server` (built with `MALLOC=libc`). `daemon.py` auto-starts it on `127.0.0.1:6379` with **AOF everysec** persistence under `RVG/data/redis/`. If `REDIS_URL` is set (e.g. Railway Redis plugin), the external Redis takes priority.
+- **Keep-alive**: `RVG/run-panel.sh` monitors the gateway and relaunches it if it dies; the gateway runs as a double-fork daemon (child of init) so it survives process-tree cleanups; `RVG/watchdog.sh` is a last-resort spawner.
+- **Wake-up friendly**: `setup.sh` wires `package.json dev` → `RVG/run-panel.sh`, so when the hosting platform restarts the dev service (e.g. after sandbox idle), the panel boots automatically with all data intact.
+- **Rotating backups**: every 5 minutes a tar snapshot of `RVG/data` is written to `RVG/backups/` (last 30 kept). Restore: `bash RVG/restore-backup.sh [file.tar.gz] [--restart]`.
+- **Logs**: `RVG/rvg.log` (gateway), `RVG/launcher.log` (launcher errors), `RVG/redis.log` (redis), `RVG/backups/` (snapshots).

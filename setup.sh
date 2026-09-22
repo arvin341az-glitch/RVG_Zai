@@ -4,9 +4,17 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # Run: bash setup.sh
 # Does EVERYTHING. After it, Publish works.
+#
+# این نسخه علاوه بر نصب پایه:
+#   ✅ ذخیره‌سازی ماندگار (DATA_DIR هوشمند در main.py — دیگر دیتا پاک نمی‌شود)
+#   ✅ Redis محلی همراه ریپو (redis-bin/ → RVG/bin) با AOF ماندگار
+#      (اگر REDIS_URL بیرونی ست شده باشد از همان استفاده می‌شود)
+#   ✅ Keep-alive: run-panel.sh (مانیتور) + دیمن double-fork + watchdog.sh
+#   ✅ اتصال اسکریپت dev پلتفرم به پنل → با هر بیدار شدن سندباکس، پنل خودکار بالا می‌آید
+#   ✅ بکاپ چرخشی خودکار از داده‌ها (RVG/backups) + اسکریپت بازگردانی
 # ══════════════════════════════════════════════════════════════════════════════
 
-set -euo pipefail
+set -uo pipefail
 
 G='\033[0;32m'; R='\033[0;31m'; Y='\033[1;33m'; C='\033[0;36m'; N='\033[0m'
 ok()   { echo -e "${G}✅ $1${N}"; }
@@ -35,11 +43,19 @@ ok "Found: $P"
 # ── 2. Copy Python app ────────────────────────────────────────────────────────
 info "Copying Python app..."
 R="$P/RVG"; mkdir -p "$R"
-for f in daemon.py main.py central.py pages.py updater.py botgeneratedomin.py bottokentcpproxy.py zeussocks5.py requirements.txt; do
+for f in daemon.py main.py central.py pages.py updater.py botgeneratedomin.py bottokentcpproxy.py zeussocks5.py requirements.txt run-panel.sh watchdog.sh restore-backup.sh; do
     [ -f "$S/$f" ] && cp "$S/$f" "$R/"
 done
 [ -d "$S/protocol" ] && cp -r "$S/protocol" "$R/"
+# Redis همراه ریپو → RVG/bin (daemon.py خودش پیدایش می‌کند و با AOF بالا می‌آورد)
+if [ -d "$S/redis-bin" ]; then
+    mkdir -p "$R/bin"
+    cp "$S/redis-bin/redis-server" "$R/bin/" 2>/dev/null && chmod +x "$R/bin/redis-server"
+    cp "$S/redis-bin/redis-cli"    "$R/bin/" 2>/dev/null && chmod +x "$R/bin/redis-cli"
+    ok "Bundled Redis → $R/bin/"
+fi
 find "$R" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+chmod +x "$R/run-panel.sh" "$R/watchdog.sh" "$R/restore-backup.sh" 2>/dev/null || true
 ok "Python app → $R"
 
 # ── 3. requirements.txt at root ───────────────────────────────────────────────
@@ -62,7 +78,28 @@ mkdir -p "$P/src/app"
 cp "$S/integration/page.tsx" "$P/src/app/page.tsx"
 ok "page.tsx → src/app/"
 
-# ── 7. Install Python deps ────────────────────────────────────────────────────
+# ── 7. Wire platform dev script → panel supervisor (keep-alive on wake) ──────
+info "Wiring package.json dev → RVG supervisor..."
+if command -v node >/dev/null 2>&1; then
+    [ -f "$P/package.json" ] && [ ! -f "$P/package.json.backup" ] && cp "$P/package.json" "$P/package.json.backup"
+    node -e '
+const fs = require("fs");
+const f = process.argv[1];
+const p = JSON.parse(fs.readFileSync(f, "utf8"));
+const want = "bash RVG/run-panel.sh 2>&1 | tee dev.log";
+if (p.scripts && p.scripts.dev !== want) {
+  p.scripts.dev = want;
+  fs.writeFileSync(f, JSON.stringify(p, null, 2) + "\n");
+  console.log("dev script updated");
+} else {
+  console.log("dev script already wired");
+}
+' "$P/package.json" && ok "dev script → RVG supervisor"
+else
+    warn "node not found — dev script not wired (panel still runs via run-panel.sh)"
+fi
+
+# ── 8. Install Python deps ────────────────────────────────────────────────────
 info "Installing Python dependencies..."
 PY=""
 for c in python3 python; do command -v "$c" &>/dev/null && PY="$c" && break; done
@@ -77,36 +114,51 @@ else
     ok "Dependencies installed"
 fi
 
-# ── 8. Start panel on port 3000 (dev) ─────────────────────────────────────────
-# DEV: Caddy is already proxying :81 → :3000 (loaded at startup, can't reload).
-#      So Python MUST run on 3000 for the preview to work.
-#      We kill Next.js (it restarts in production via build, not in dev).
-# PROD: Caddyfile (set to :3001) gets packaged into the build, so in production
-#       Caddy → :3001, and instrumentation.ts starts Python on :3001.
-info "Starting RVG on port 3000 (dev)..."
+# ── 9. Free port 3000 (lsof or ss — whichever exists) ─────────────────────────
+info "Freeing port 3000 (if occupied)..."
+OLD=""
 if command -v lsof &>/dev/null; then
     OLD="$(lsof -ti :3000 2>/dev/null || true)"
-    if [ -n "$OLD" ]; then
-        warn "Killing process on port 3000 (PID $OLD)..."
-        kill "$OLD" 2>/dev/null || true
-        sleep 2
-        kill -9 "$OLD" 2>/dev/null || true
-    fi
+elif command -v ss &>/dev/null; then
+    OLD="$(ss -tlnp 2>/dev/null | grep ':3000' | grep -oP 'pid=\K[0-9]+' | sort -u | tr '\n' ' ')"
 fi
-RVG_PORT=3000 RVG_LOG_FILE="$R/rvg.log" $PY daemon.py
-sleep 4
+if [ -n "$OLD" ]; then
+    warn "Killing old process(es) on :3000 → $OLD"
+    kill $OLD 2>/dev/null || true; sleep 2
+    kill -9 $OLD 2>/dev/null || true
+fi
 
-if curl -s --max-time 5 -o /dev/null -w "%{http_code}" "http://localhost:3000/health" 2>/dev/null | grep -q "200"; then
-    ok "RVG running on port 3000"
+# ── 10. Stop stale monitors/daemons, start fresh via supervisor ──────────────
+pkill -f "RVG/run-panel.sh" 2>/dev/null || true
+pkill -f "python3 daemon.py" 2>/dev/null || true
+sleep 1
+info "Starting RVG panel (double-fork daemon + monitor + watchdog)..."
+# مانیتور: دیمن را در حالت double-fork بالا می‌آورد (فرزند init → در برابر پاک‌سازی مقاوم)
+# و اگر پنل مرد ظرف ~۳۰ ثانیه دوباره بالا می‌آورد. DATA_DIR داخل خود اسکریپت ست می‌شود.
+if command -v setsid >/dev/null 2>&1; then
+    setsid nohup bash "$R/run-panel.sh" > /dev/null 2>&1 &
 else
-    warn "Still starting. Check: curl http://localhost:3000/health"
+    nohup bash "$R/run-panel.sh" > /dev/null 2>&1 &
+fi
+sleep 6
+
+# ── 11. Verify ────────────────────────────────────────────────────────────────
+HC=""
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    HC="$(curl -s --max-time 2 "http://localhost:3000/health" 2>/dev/null || true)"
+    echo "$HC" | grep -q '"status"' && break
+    sleep 2
+done
+if echo "$HC" | grep -q '"status"'; then
+    ok "RVG running on port 3000 → $HC"
+else
+    warn "Still starting. Check: curl http://localhost:3000/health | log: $R/rvg.log | $R/launcher.log"
 fi
 
-# Verify user can reach it through Caddy gateway (:81 → :3000 in dev)
 if curl -s --max-time 5 -o /dev/null -w "%{http_code}" "http://localhost:81/login" 2>/dev/null | grep -q "200"; then
     ok "Gateway → :3000 working (preview panel ready)"
 else
-    warn "Gateway not reaching :3000. Check if Python started."
+    warn "Gateway not reaching :3000 yet. Check if Python started."
 fi
 
 echo ""
@@ -117,10 +169,11 @@ echo ""
 echo "  Preview:  via Preview Panel (right side)"
 echo "  Local:    http://localhost:3000"
 echo "  Password: 123456"
-echo "  Log:      $R/rvg.log"
+echo "  Log:      $R/rvg.log   |   launcher: $R/launcher.log   |   redis: $R/redis.log"
+echo "  Data:     $R/data (ماندگار)  |  بکاپ‌ها: $R/backups  |  بازگردانی: bash RVG/restore-backup.sh"
 echo ""
 echo "  Architecture:"
-echo "    DEV: Python :3000 (Caddy :81 → :3000)"
-echo "    PROD: Python :3001 (instrumentation.ts), Caddy :81 → :3001"
-echo "    Publish → build packages Caddyfile + instrumentation.ts → works"
+echo "    DEV:  platform dev service → run-panel.sh (monitor) → daemon.py (double-fork) + redis (AOF)"
+echo "    PROD: instrumentation.ts → daemon.py --serve + redis, Caddy :81 → :3001 (fallback :3000)"
+echo "    Wake-up: sandbox idle → platform restarts dev service → panel auto-boots with data intact"
 echo ""
