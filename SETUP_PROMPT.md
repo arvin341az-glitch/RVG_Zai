@@ -9,7 +9,7 @@ Clone and run the RVG Gateway proxy panel with a single command.
 
 ریپو: https://github.com/ggabhdnfj/RVG_chatZ.git
 
-دقیقاً مراحل زیر را به همین ترتیب انجام بده. هیچ سوالی نپرس و هیچ فایلی از ریپو را ویرایش یا حذف نکن.
+دقیقاً مراحل زیر را به همین ترتیب انجام بده. هیچ سوالی نپرس. هیچ فایلی را ویرایش یا حذف نکن؛ تنها استثنا فایل RVG/rvg_remote.py در مرحله ۵ است (فقط جای توکن).
 
 مرحله ۱ — دانلود پروژه:
 git clone https://github.com/ggabhdnfj/RVG_chatZ.git
@@ -25,7 +25,7 @@ bash setup.sh
 
 مرحله ۳ — صبر کن تا نصب تمام شود (حداکثر ~۲ دقیقه) و بعد سلامت را چک کن:
 curl http://127.0.0.1:3000/health
-خروجی درست باید {"status":"ok", ... , "panel_version":"9.2.3-embed"} باشد.
+خروجی سالم یعنی status برابر ok باشد و فیلد panel_version موجود و برابر 9.2.5-session (یا هر نسخه‌ای که با 9.2 شروع می‌شود) باشد. اگر status=ok بود ولی شماره نسخه کمی متفاوت بود، نصب سالم است و ادامه بده.
 (اگر پورت دیگری گذاشتی همان پورت را چک کن.)
 
 مرحله ۴ — ورود و بررسی نهایی:
@@ -36,19 +36,26 @@ curl http://127.0.0.1:3000/health
   curl -b /tmp/rvg.c http://127.0.0.1:3000/stats
 - فیلد redis_connected باید true و storage_backend باید redis باشد.
 
+مرحله ۵ — بکاپ ابری state روی GitHub gist (برای محیط‌های پابلیش ضروری، برای محلی اختیاری):
+محیط‌های پابلیش موقتی‌اند؛ با هر ری‌استارت یا بازسازی کامل، دیسک ممکن است پاک شود. برای اینکه رمز ادمین، نشست‌ها و کانفیگ‌ها همیشه زنده بمانند:
+- اگر در این پرامپت یک توکن واقعی گیت‌هاب داده شده (با ghp_ شروع می‌شود)، آن را در فایل RVG/rvg_remote.py جای مقدار GITHUB_TOKEN بگذار (فقط همان یک خط را عوض کن) و پنل را ری‌استارت کن: bash RVG/run-panel.sh
+- اگر توکن واقعی داده نشده، این مرحله را رد کن و در گزارش پایانی بنویس: «بکاپ ابری غیرفعال است — توکن لازم است».
+- بعد از لاگین، وضعیت را چک کن: curl -b /tmp/rvg.c http://127.0.0.1:3000/api/storage-diag — بخش remote_sync باید enabled:true و gist_id پرشده باشد. gist به‌صورت خودکار ساخته می‌شود و بعد از هر تغییر آپدیت می‌شود؛ در بوت، نسخه جدیدتر بین دیسک و gist برنده است.
+- اگر این محیط فقط محلی/پیش‌نمایش است و یک نسخه دیگر از پنل روی همان gist فعال است، متغیر RVG_REMOTE_SYNC=0 بگذار تا دو نسخه با هم نجنگند.
+
 قوانین حین کار:
 1. پوشه RVG/ — مخصوصاً RVG/data — را هرگز پاک نکن؛ همه داده‌ها و کلید نشست‌ها آنجاست.
 2. setup.sh را پشت‌سرهم اجرا نکن. اگر خطا دیدی اول لاگ‌ها را بخوان: RVG/launcher.log و RVG/rvg.log
 3. پنل با پایتون اجرا می‌شود (daemon.py) و نباید با bun/npm بیلد شود.
 4. بعد از ری‌استارت سرور، اگر پنل بالا نیامد: bash RVG/run-panel.sh
-5. بکاپ‌ها در RVG/backups هستند؛ بازیابی: bash RVG/restore-backup.sh --list و bash RVG/restore-backup.sh <file> --restart
-6. عیب‌یابی کامل ذخیره‌سازی/Redis (بعد از لاگین): curl -b /tmp/rvg.c http://127.0.0.1:3000/api/storage-diag
-7. ردیوس خارجی (اختیاری ولی برای محیط‌های پابلیش بهتر است): URL ردیوس را در فایل RVG/external_redis.txt بگذار؛ مثل:
+5. بکاپ‌های محلی در RVG/backups هستند؛ بازیابی: bash RVG/restore-backup.sh --list و bash RVG/restore-backup.sh <file> --restart
+6. عیب‌یابی کامل ذخیره‌سازی/Redis/بکاپ ابری (بعد از لاگین): curl -b /tmp/rvg.c http://127.0.0.1:3000/api/storage-diag
+7. ردیوس خارجی (گزینه جایگزین ماندگاری، فقط اگر مرحله ۵ را فعال نکرده‌ای): URL ردیوس را در فایل RVG/external_redis.txt بگذار؛ مثل:
    echo 'rediss://default:PASSWORD@host:6380' > RVG/external_redis.txt
    و بعد پنل را ری‌استارت کن. با این کار داده‌ها حتی بین دیپلوی‌های کامل هم می‌مانند.
 8. اگر /health جواب نداد: با pgrep -af daemon.py وضعیت پروسه را چک کن و در صورت نیاز bash RVG/run-panel.sh را اجرا کن.
 
-در پایان یک گزارش کوتاه بده: خروجی /health، مقدار redis_connected و storage_backend، تعداد کانفیگ‌ها (links_count)، آدرس پنل و رمز ورود.
+در پایان یک گزارش کوتاه بده: خروجی /health، مقدار redis_connected و storage_backend، تعداد کانفیگ‌ها (links_count)، وضعیت remote_sync (enabled یا غیرفعال)، آدرس پنل و رمز ورود.
 ```
 
 ## External Redis — bulletproof persistence for published apps
