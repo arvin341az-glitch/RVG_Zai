@@ -27,7 +27,12 @@ Notes for the AI:
 - If port 3000 is busy: lsof -ti :3000 | xargs kill -9, or ss -tlnp | grep :3000 → kill PID.
 - Data persists in RVG/data (state json + secret) and in bundled Redis (AOF) — nothing is wiped on restarts.
 - Rotating backups live in RVG/backups; restore with: bash RVG/restore-backup.sh [file] [--restart]
-- To use an external Redis (e.g. Railway plugin), just set REDIS_URL env — it takes priority.
+- To use an external Redis (e.g. Upstash / Railway plugin): set REDIS_URL env,
+  OR create RVG/external_redis.txt containing the connection URL (one line).
+  The file takes effect at every boot — survives redeploys because it ships with the project.
+- Storage diagnostics endpoint (auth required): GET /api/storage-diag — reports
+  redis client/binary status, exec tests, writable dirs. Use it when the published
+  app shows Redis disconnected.
 
 After setup completes, open http://localhost:3000 in your browser.
 Login with password: 123456
@@ -41,6 +46,22 @@ In the dashboard you can:
 Note: VLESS-WS, Trojan-WS, and Shadowsocks work through the gateway.
 xhttp and hysteria protocols do NOT work through HTTP-only gateways.
 ```
+
+## External Redis — bulletproof persistence for published apps
+
+The bundled local Redis (AOF) survives restarts and idle wake-ups. But a full
+redeploy of a published app rebuilds the image — only an EXTERNAL Redis survives
+that. Free options: Upstash (serverless, TLS).
+
+1. Create a free Redis at upstash.com (or any provider) and copy its URL
+   (looks like `rediss://default:PASSWORD@host:6380`).
+2. Put that URL in a file named `external_redis.txt` inside the RVG folder
+   (next to daemon.py), e.g.:
+   ```bash
+   echo 'rediss://default:PASSWORD@host:6380' > RVG/external_redis.txt
+   ```
+3. Restart the panel (or re-publish). From now on ALL panel state is stored on
+   that external Redis and survives everything: restarts, idle wake-ups AND redeploys.
 
 ## Manual Setup
 

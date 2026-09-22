@@ -366,7 +366,7 @@ def _build_clash_config(uuid_val, host, protocol, link, local=False):
 # ── Add config endpoints ──────────────────────────────────────────────────────
 
 def add_config_endpoints(main_mod, app):
-    from fastapi import Request, HTTPException
+    from fastapi import Request, HTTPException, Depends
     from fastapi.responses import Response, PlainTextResponse, JSONResponse
 
     LINKS = main_mod.LINKS
@@ -395,6 +395,101 @@ def add_config_endpoints(main_mod, app):
             "resolved": _get_host(request),
             "ctx": _request_host_ctx.get(""),
         })
+
+    @app.get("/api/storage-diag")
+    async def storage_diag(_=Depends(main_mod.require_auth)):
+        """عیب‌یابی کامل ذخیره‌سازی/Redis — مخصوص محیط‌های production که لاگ
+       شان مستقیم در دسترس نیست. هیچ اطلاعات حساسی برنمی‌گرداند."""
+        import importlib.util
+        import platform as _platform
+
+        diag: dict = {
+            "python": sys.version.split()[0],
+            "platform": f"{_platform.system()} {_platform.machine()}",
+            "cwd": os.getcwd(),
+            "work_dir": WORK_DIR,
+            "redis_port": REDIS_PORT,
+            "redis_url_env_set": bool(os.environ.get("REDIS_URL", "").strip()),
+            "external_redis_txt": os.path.isfile(os.path.join(WORK_DIR, "external_redis.txt")),
+            "redis_ping": _redis_alive(),
+        }
+        try:
+            import redis as _r
+            diag["redis_pylib"] = {"ok": True,
+                                   "version": getattr(_r, "__version__", "?"),
+                                   "path": str(getattr(_r, "__file__", "?"))}
+        except Exception as e:
+            diag["redis_pylib"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        try:
+            import redis.asyncio as _ra  # noqa: F401
+            diag["redis_asyncio"] = {"ok": True}
+        except Exception as e:
+            diag["redis_asyncio"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        try:
+            diag["pip_available"] = importlib.util.find_spec("pip") is not None
+        except Exception:
+            diag["pip_available"] = False
+
+        diag["redis_binary_candidates"] = _redis_binary_report()
+        bin_path = _find_redis_binary()
+        diag["redis_binary_chosen"] = bin_path
+        if bin_path:
+            try:
+                out = subprocess.run([bin_path, "--version"], capture_output=True,
+                                     text=True, timeout=10)
+                diag["redis_binary_exec_test"] = {
+                    "ok": out.returncode == 0,
+                    "returncode": out.returncode,
+                    "stdout": out.stdout.strip()[:120],
+                    "stderr": out.stderr.strip()[:200],
+                }
+            except Exception as e:
+                diag["redis_binary_exec_test"] = {"ok": False,
+                                                  "error": f"{type(e).__name__}: {e}"}
+
+        try:
+            dd = main_mod.DATA_DIR
+            diag["main_data_dir"] = str(dd)
+            probe = dd / ".diag_write_test"
+            probe.write_text("ok")
+            probe.unlink()
+            diag["data_dir_writable"] = True
+        except Exception as e:
+            diag["data_dir_writable"] = False
+            diag["data_dir_error"] = f"{type(e).__name__}: {e}"
+        try:
+            diag["state_file_exists"] = bool(main_mod.DATA_FILE.exists())
+        except Exception:
+            diag["state_file_exists"] = False
+        diag["redis_connected"] = bool(main_mod.REDIS_CONNECTED)
+        diag["storage_backend"] = "redis" if main_mod.REDIS_CONNECTED else "file"
+        diag["links_count"] = len(main_mod.LINKS)
+
+        try:
+            entries = sorted(e.name + ("/" if e.is_dir() else "")
+                             for e in os.scandir(WORK_DIR))
+            diag["work_dir_entries"] = entries[:80]
+            bin_dir = os.path.join(WORK_DIR, "bin")
+            if os.path.isdir(bin_dir):
+                diag["bin_dir_entries"] = sorted(
+                    f"{e.name}:{e.stat().st_size}" for e in os.scandir(bin_dir))[:20]
+            vendor_dir = os.path.join(WORK_DIR, "vendor")
+            if os.path.isdir(vendor_dir):
+                diag["vendor_dir_entries"] = sorted(
+                    e.name for e in os.scandir(vendor_dir))[:20]
+        except Exception as e:
+            diag["work_dir_entries"] = f"error: {type(e).__name__}: {e}"
+
+        try:
+            p = os.path.join(WORK_DIR, "redis.log")
+            if os.path.isfile(p):
+                with open(p, "rb") as fh:
+                    fh.seek(0, 2)
+                    fh.seek(max(0, fh.tell() - 2000))
+                    diag["redis_log_tail"] = fh.read().decode("utf-8", "replace").splitlines()[-15:]
+        except Exception:
+            pass
+        return JSONResponse(diag)
 
     @app.get("/api/protocols/status")
     async def protocols_status(request: Request):
@@ -518,13 +613,34 @@ def _writable_dir(*candidates: str) -> str | None:
     return None
 
 
-def _find_redis_binary() -> str | None:
-    """پیدا کردن باینری redis-server — شامل ترمیم خودکار exec bit که بعضی
-    پایپ‌لاین‌های دیپلوی موقع کپی حذفش می‌کنند."""
+def _external_redis_url() -> str:
+    """REDIS_URL از env، وگرنه از فایل external_redis.txt (کنار daemon.py یا در
+    DATA_DIR). فایل برای Redis خارجی مثل Upstash/Railway است — تنها چیزی که
+    بین redeploy های کامل محیط production زنده می‌ماند."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if url:
+        return url
+    for f in (os.path.join(WORK_DIR, "external_redis.txt"),
+              os.path.join(os.environ.get("DATA_DIR") or WORK_DIR, "external_redis.txt")):
+        try:
+            if os.path.isfile(f):
+                with open(f, "r", encoding="utf-8") as fh:
+                    u = fh.read().strip()
+                if u:
+                    print(f"[RVG] REDIS_URL read from {f}", file=sys.stderr)
+                    return u
+        except Exception:
+            continue
+    return ""
+
+
+def _redis_binary_report() -> list:
+    """گزارش همه‌ی کاندیدهای باینری redis — برای endpoint عیب‌یابی (storage-diag)."""
     candidates = [
         os.path.join(WORK_DIR, "bin", "redis-server"),              # RVG/bin (توسط setup.sh کپی می‌شود)
         os.path.join(WORK_DIR, "redis-bin", "redis-server"),        # اجرای مستقیم از داخل RVG
         os.path.join(WORK_DIR, "..", "redis-bin", "redis-server"),  # اجرای مستقیم از داخل کلون ریپو
+        os.path.join(WORK_DIR, "..", "..", "redis-bin", "redis-server"),
         os.path.expanduser("~/.local/bin/redis-server"),
         "/usr/local/bin/redis-server",
         "/usr/bin/redis-server",
@@ -535,19 +651,100 @@ def _find_redis_binary() -> str | None:
             candidates.append(which)
     except Exception:
         pass
+    report = []
     for c in candidates:
-        if not c or not os.path.isfile(c):
-            continue
-        if not os.access(c, os.X_OK):
-            # exec bit حذف شده — ترمیم می‌کنیم (deploy pipeline ها گاهی پرمیژن‌ها را می‌بُرند)
-            try:
-                os.chmod(c, 0o755)
-                print(f"[RVG] restored exec bit on {c}", file=sys.stderr)
-            except Exception:
-                continue
-        if os.access(c, os.X_OK):
-            return c
-    return None
+        try:
+            exists = bool(c) and os.path.isfile(c)
+            report.append({"path": c, "exists": exists,
+                           "exec_ok": bool(exists and os.access(c, os.X_OK))})
+        except Exception:
+            report.append({"path": c, "exists": False, "exec_ok": False})
+    return report
+
+
+def _find_redis_binary() -> str | None:
+    """اولین باینری موجود. اجرایی‌ها اولویت دارند؛ اگر هیچ‌کدام اجرایی نبود همان
+    مسیر برمی‌گردد — _ensure_redis موقع spawn مشکل exec را دور می‌زند (کپی به tmp)."""
+    report = _redis_binary_report()
+    exec_ok = next((r["path"] for r in report if r["exec_ok"]), None)
+    if exec_ok:
+        return exec_ok
+    exists_any = next((r["path"] for r in report if r["exists"]), None)
+    if exists_any:
+        try:
+            os.chmod(exists_any, 0o755)
+        except Exception:
+            pass
+    return exists_any
+
+
+def _spawn_redis(bin_path: str, redis_dir: str, logf=None) -> None:
+    cmd = [bin_path, "--port", str(REDIS_PORT), "--bind", "127.0.0.1",
+           "--dir", redis_dir, "--appendonly", "yes", "--appendfsync", "everysec"]
+    if logf is not None:
+        subprocess.Popen(cmd, stdout=logf, stderr=logf, start_new_session=True)
+    else:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def _ensure_redis():
+    """اگر Redis خارجی (env یا external_redis.txt) تعریف شده باشد از همان
+    استفاده می‌شود. وگرنه سعی می‌کند Redis محلی را با باینری همراه ریپو بالا
+    بیاورد — با AOF (appendonly) تا state بین ری‌استارت‌ها ماندگار بماند.
+    اگر باینری در جایش اجرایی نبود (noexec mount)، به tmp کپی و از آنجا اجرا
+    می‌شود. اگر هیچ‌کدام نشد، پنل روی فایل محلی کار می‌کند و هیچ‌چیز نمی‌شکند."""
+    url = _external_redis_url()
+    if url:
+        os.environ["REDIS_URL"] = url
+        print("[RVG] external REDIS_URL configured — using external Redis.", file=sys.stderr)
+        return
+    if _redis_alive():
+        os.environ["REDIS_URL"] = f"redis://127.0.0.1:{REDIS_PORT}/0"
+        print(f"[RVG] Redis already running on 127.0.0.1:{REDIS_PORT} — reusing it.", file=sys.stderr)
+        return
+    redis_bin = _find_redis_binary()
+    if not redis_bin:
+        print("[RVG] no redis-server binary found — falling back to local file storage (DATA_DIR).", file=sys.stderr)
+        return
+    # مسیر AOF: اول DATA_DIR، بعد کنار برنامه، آخر /tmp (همیشه قابل نوشتن)
+    redis_dir = _writable_dir(
+        os.path.join(os.environ.get("DATA_DIR") or WORK_DIR, "redis"),
+        os.path.join(WORK_DIR, "redis"),
+        f"{tempfile.gettempdir()}/rvg-redis-{REDIS_PORT}",
+    )
+    if not redis_dir:
+        print("[RVG] no writable dir for Redis AOF — falling back to file storage.", file=sys.stderr)
+        return
+    logf = None
+    try:
+        log_dir = _writable_dir(WORK_DIR, tempfile.gettempdir()) or tempfile.gettempdir()
+        logf = open(os.path.join(log_dir, "redis.log"), "ab")
+    except Exception:
+        logf = None
+    try:
+        _spawn_redis(redis_bin, redis_dir, logf)
+    except Exception:
+        # mount نوexec یا پرمیژن ناکافی در production — باینری را به tmp کپی
+        # می‌کنیم و از آنجا اجرا می‌کنیم (tmp تقریباً همیشه exec اجازه می‌دهد)
+        try:
+            tmp_bin_dir = os.path.join(tempfile.gettempdir(), "rvg-redis-bin")
+            os.makedirs(tmp_bin_dir, exist_ok=True)
+            tmp_bin = os.path.join(tmp_bin_dir, "redis-server")
+            shutil.copy2(redis_bin, tmp_bin)
+            os.chmod(tmp_bin, 0o755)
+            _spawn_redis(tmp_bin, redis_dir, logf)
+            print(f"[RVG] redis binary not executable in place — copied to {tmp_bin} and started.", file=sys.stderr)
+        except Exception as e:
+            print(f"[RVG] failed to launch Redis: {e} — falling back to file storage.", file=sys.stderr)
+            return
+    for _ in range(40):
+        if _redis_alive():
+            os.environ["REDIS_URL"] = f"redis://127.0.0.1:{REDIS_PORT}/0"
+            print(f"[RVG] local Redis up on port {REDIS_PORT} — state on Redis (AOF persistent).", file=sys.stderr)
+            return
+        time.sleep(0.25)
+    print("[RVG] Redis did not answer — falling back to file storage.", file=sys.stderr)
 
 
 def _ensure_redis_pylib() -> bool:
@@ -586,52 +783,6 @@ def _ensure_redis_pylib() -> bool:
     return False
 
 
-def _ensure_redis():
-    """اگر REDIS_URL از بیرون ست شده باشد (مثلاً Redis افزونه‌ی Railway) از همان
-    استفاده می‌شود. وگرنه سعی می‌کند یک Redis محلی را با باینری همراه ریپو
-    (redis-bin/ یا RVG/bin/) بالا بیاورد — با AOF (appendonly) تا state بین
-    ری‌استارت‌ها ماندگار بماند. اگر هیچ‌کدام نشد، پنل روی فایل محلی (DATA_DIR
-    هوشمند) کار می‌کند و هیچ‌چیز نمی‌شکند."""
-    if os.environ.get("REDIS_URL", "").strip():
-        print("[RVG] REDIS_URL set in env — using external Redis.", file=sys.stderr)
-        return
-    if _redis_alive():
-        os.environ["REDIS_URL"] = f"redis://127.0.0.1:{REDIS_PORT}/0"
-        print(f"[RVG] Redis already running on 127.0.0.1:{REDIS_PORT} — reusing it.", file=sys.stderr)
-        return
-    redis_bin = _find_redis_binary()
-    if not redis_bin:
-        print("[RVG] no redis-server binary found — falling back to local file storage (DATA_DIR).", file=sys.stderr)
-        return
-    # مسیر AOF: اول DATA_DIR، بعد کنار برنامه، آخر /tmp (همیشه قابل نوشتن)
-    redis_dir = _writable_dir(
-        os.path.join(os.environ.get("DATA_DIR") or WORK_DIR, "redis"),
-        os.path.join(WORK_DIR, "redis"),
-        f"{tempfile.gettempdir()}/rvg-redis-{REDIS_PORT}",
-    )
-    if not redis_dir:
-        print("[RVG] no writable dir for Redis AOF — falling back to file storage.", file=sys.stderr)
-        return
-    try:
-        log_dir = _writable_dir(WORK_DIR, tempfile.gettempdir()) or tempfile.gettempdir()
-        logf = open(os.path.join(log_dir, "redis.log"), "ab")
-        subprocess.Popen(
-            [redis_bin, "--port", str(REDIS_PORT), "--bind", "127.0.0.1",
-             "--dir", redis_dir, "--appendonly", "yes", "--appendfsync", "everysec"],
-            stdout=logf, stderr=logf, start_new_session=True,
-        )
-    except Exception as e:
-        print(f"[RVG] failed to launch Redis: {e} — falling back to file storage.", file=sys.stderr)
-        return
-    for _ in range(40):
-        if _redis_alive():
-            os.environ["REDIS_URL"] = f"redis://127.0.0.1:{REDIS_PORT}/0"
-            print(f"[RVG] local Redis up on port {REDIS_PORT} — state on Redis (AOF persistent).", file=sys.stderr)
-            return
-        time.sleep(0.25)
-    print("[RVG] Redis did not answer — falling back to file storage.", file=sys.stderr)
-
-
 # ── serve() — shared by sandbox and production ────────────────────────────────
 
 def serve():
@@ -639,6 +790,14 @@ def serve():
     - sandbox: after double-fork
     - production: directly from instrumentation.ts via `python3 daemon.py --serve`
     """
+    # پکیج‌های python خالص همراه ریپو (کلاینت redis) — بدون نیاز به pip/اینترنت.
+    # باید قبل از import شدن main روی sys.path باشند (main در import اولیه
+    # redis.asyncio را probe می‌کند).
+    for _d in ("vendor", "pylibs"):
+        _p = os.path.join(WORK_DIR, _d)
+        if os.path.isdir(_p) and _p not in sys.path:
+            sys.path.insert(0, _p)
+
     _ensure_redis()
     # پکیج پایتون redis هم باید موجود باشد وگرنه REDIS_URL ست می‌شود ولی main
     # نمی‌تواند وصل شود (aioredis=None). این تابع در صورت نیاز self-heal می‌کند.

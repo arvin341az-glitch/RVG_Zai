@@ -56,6 +56,13 @@ if [ -d "$S/redis-bin" ]; then
     cp "$S/redis-bin/redis-cli"    "$R/bin/" 2>/dev/null && chmod +x "$R/bin/redis-cli"
     ok "Bundled Redis → $R/bin/"
 fi
+# پکیج‌های python خالص همراه ریپو (کلاینت redis) → RVG/vendor
+# در production بدون pip/اینترنت هم کار می‌کند.
+if [ -d "$S/vendor" ]; then
+    mkdir -p "$R/vendor"
+    cp -r "$S/vendor/." "$R/vendor/" 2>/dev/null
+    ok "Vendored redis client → $R/vendor"
+fi
 find "$R" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 chmod +x "$R/run-panel.sh" "$R/watchdog.sh" "$R/restore-backup.sh" 2>/dev/null || true
 ok "Python app → $R"
