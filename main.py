@@ -27,7 +27,7 @@ def _install_packages():
 
 # _install_packages()  # deps preinstalled for local test
 
-PANEL_VERSION = "9.2.4-remote"
+PANEL_VERSION = "9.2.5-session"
 
 import asyncio
 import contextvars
@@ -366,10 +366,14 @@ def _state_payload() -> dict:
     }
 
 
-async def save_state():
+async def save_state(bump: bool = True):
+    """bump=False برای ذخیره‌های پرتعداد آماری (ترافیک) است تا STATE_SEQ فقط با
+    تغییرات واقعی (رمز/کانفیگ/نشست/ساب) جلو برود — وگرنه شمارنده نسخه با هر
+    اتصال باد می‌کند و مقایسه‌ی «کدام‌یک جدیدتر است» بین سرور و gist بی‌معنا می‌شود."""
     global STATE_SEQ
     async with SAVE_LOCK:
-        STATE_SEQ += 1
+        if bump:
+            STATE_SEQ += 1
         data = _state_payload()
         wrote_to_redis = False
         if REDIS_CONNECTED and redis_client:
@@ -412,7 +416,7 @@ async def schedule_save():
         while True:
             _save_dirty_again = False
             await asyncio.sleep(SAVE_DEBOUNCE_SECONDS)
-            await save_state()
+            await save_state(bump=False)
             if not _save_dirty_again:
                 break
     finally:
@@ -605,6 +609,28 @@ def _apply_remote_state(data: dict) -> None:
         pass
 
 
+async def remote_periodic_sync():
+    """هر ۱۲۰ ثانیه gist را چک می‌کند؛ اگر نسخه‌ی جدیدتری داشته باشد، state را
+    می‌پذیرد. این باعث می‌شود: (۱) بعد از overlap دیپلوی/ری‌استارت که دو نسخه
+    موقتاً همزمان بالا هستند همگرا شوند، (۲) اگر بوت، pull را از دست داده بود
+    خودش ترمیم شود. sessions همیشه merge می‌شوند (چیزی حذف نمی‌شود)."""
+    while True:
+        await asyncio.sleep(120)
+        if not REMOTE["enabled"]:
+            continue
+        try:
+            data = await remote_pull()
+            if data is None:
+                continue
+            remote_seq = int(data.get("seq") or 0)
+            if remote_seq > STATE_SEQ:
+                _apply_remote_state(data)
+                await save_state(bump=False)
+                logger.info(f"Periodic remote sync: state updated from gist (remote seq={remote_seq})")
+        except Exception as e:
+            REMOTE["last_error"] = f"{type(e).__name__}: {e}"
+
+
 async def remote_boot_sync():
     """موقع بوت: نسخه‌ی جدیدتر بین state محلی و gist برنده می‌شود.
       - gist جدیدتر بود → state محلی/در-RAM با gist جایگزین و روی دیسک/Redis نوشته می‌شود.
@@ -753,6 +779,12 @@ async def create_session() -> str:
     async with SESSIONS_LOCK:
         SESSIONS[token] = time.time() + SESSION_TTL
     await _persist_sessions()
+    try:
+        # نشست جدید = تغییر واقعی state؛ بلافاصله روی فایل/Redis/gist می‌رود تا
+        # اگر سرور همان لحظه ری‌استارت شد، کاربر لاگین بماند.
+        await save_state()
+    except Exception:
+        pass
     return token
 
 async def is_valid_session(token: str | None) -> bool:
@@ -773,6 +805,10 @@ async def destroy_session(token: str | None):
     async with SESSIONS_LOCK:
         SESSIONS.pop(token, None)
     await _persist_sessions()
+    try:
+        await save_state()
+    except Exception:
+        pass
 
 async def require_auth(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
@@ -800,6 +836,7 @@ async def startup():
             await asyncio.wait_for(remote_boot_sync(), timeout=30.0)
         except Exception as e:
             logger.warning(f"remote boot sync skipped/failed: {e}")
+        asyncio.create_task(remote_periodic_sync())
     await _restart_mtproto_instances()
     log_activity("system", "سرور راه‌اندازی شد", "ok")
     logger.info(f"RVG Gateway v9.2 started on port {CONFIG['port']}")

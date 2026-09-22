@@ -3411,12 +3411,43 @@ function protoBadge(p){
   const v=m[p]||['ناشناخته','pc-ws'];
   return `<span class="proto-chip ${v[1]}">${v[0]}</span>`;
 }
-async function checkAuth(){try{const r=await fetch('/api/me');const d=await r.json();if(!d.authenticated)location.href='/login';}catch(e){location.href='/login'}}
+function ensureConnBadge(){
+  let b=document.getElementById('conn-lost-badge');
+  if(!b){b=document.createElement('div');b.id='conn-lost-badge';
+    b.style.cssText='position:fixed;bottom:14px;left:14px;z-index:99999;display:none;align-items:center;gap:8px;background:#7f1d1d;color:#fff;padding:9px 16px;border-radius:12px;font-size:13px;box-shadow:0 6px 18px rgba(0,0,0,.45)';
+    b.innerHTML='<span style="width:8px;height:8px;border-radius:50%;background:#fca5a5;display:inline-block"></span> اتصال به سرور لحظه‌ای قطع شده — در حال تلاش مجدد…';
+    (document.body||document.documentElement).appendChild(b);}
+  return b;
+}
+function setConnLost(v){try{const b=ensureConnBadge();b.style.display=v?'flex':'none';}catch(e){}}
+async function checkAuth(){
+  let confirmed401=false;
+  for(let i=0;i<6;i++){
+    try{
+      const r=await fetch('/api/me');
+      if(r.ok){const d=await r.json();if(d.authenticated){setConnLost(false);return;}}
+      if(r.status===401){
+        if(confirmed401){location.href='/login';return;}
+        confirmed401=true; /* ممکن است موقتی باشد (ری‌استارت/دو اینستنس) — دوباره تأیید می‌کنیم */
+      }
+    }catch(e){setConnLost(true);}
+    await new Promise(res=>setTimeout(res,1200+i*800));
+  }
+}
 async function logout(){try{await fetch('/api/logout',{method:'POST'})}catch(e){}location.href='/login'}
 document.getElementById('logout-btn').addEventListener('click',logout);
+let _authVerifying=false;
 async function authF(url,opts={},skipAuthRedirect=false){
   const r=await fetch(url,opts);
-  if(r.status===401 && !skipAuthRedirect){location.href='/login';throw new Error('unauthorized')}
+  if(r.status===401 && !skipAuthRedirect){
+    if(_authVerifying)throw new Error('unauthorized');
+    _authVerifying=true;
+    let stillOut=true;
+    try{const me=await fetch('/api/me');if(me.ok){const d=await me.json();stillOut=!d.authenticated;}}catch(e){stillOut=false;}
+    _authVerifying=false;
+    if(!stillOut){setConnLost(false);return await fetch(url,opts);} /* نشست سالم است — قطعی موقتی بود */
+    location.href='/login';throw new Error('unauthorized');
+  }
   return r;
 }
 function setQuota(val,unit,el){
@@ -3458,6 +3489,7 @@ let prevTraf=0,ch1,ch3;
 async function fetchStats(){
   try{
     const r=await authF('/stats'),d=await r.json();
+    setConnLost(false);
     document.getElementById('m-conns').textContent=d.active_connections;
     document.getElementById('conns-nb').textContent=d.active_connections;
     document.getElementById('m-traffic').innerHTML=d.total_traffic_mb.toFixed(1)+'<span class="m-unit">MB</span>';
@@ -3512,7 +3544,7 @@ async function fetchStats(){
       }
     }
     renderErrs(d.recent_errors||[]);
-  }catch(e){console.error(e)}
+  }catch(e){setConnLost(true);}
 }
 function renderErrs(errs){
   const el=document.getElementById('errs-full');if(!el)return;
