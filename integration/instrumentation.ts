@@ -58,17 +58,54 @@ export async function register() {
   // never clobber it, or ABI-mismatched wheels could break the import.
   const vendor = path.join(rvgDir, "vendor");
   const mergedPath = [process.env.PYTHONPATH, vendor].filter(Boolean).join(":");
-  let hasDeps = false;
-  try {
-    execFileSync(py, ["-c", "import fastapi, uvicorn"], {
-      env: { ...process.env, PYTHONPATH: mergedPath },
-      stdio: "pipe",
-      timeout: 30_000,
-    });
-    hasDeps = true;
-    console.log("[RVG] python deps OK");
-  } catch {
-    console.log("[RVG] bundled/platform deps unusable — falling back to pip install ...");
+  const probeEnv = { ...process.env, PYTHONPATH: mergedPath };
+  // NOTE: the redis client package is REQUIRED for the Redis persistence
+  // backend. Images whose python runtime was built from an older
+  // requirements.txt have fastapi/uvicorn but no `redis` — the panel would
+  // boot with REDIS_URL set yet never connect (silent file fallback).
+  const probeDeps = (): boolean => {
+    try {
+      execFileSync(py, ["-c", "import fastapi, uvicorn, redis.asyncio"], {
+        env: probeEnv,
+        stdio: "pipe",
+        timeout: 30_000,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  let hasDeps = probeDeps();
+  if (hasDeps) {
+    console.log("[RVG] python deps OK (fastapi, uvicorn, redis)");
+  } else {
+    console.log(
+      "[RVG] deps incomplete — self-heal: pip install --target vendor redis ...",
+    );
+    // Fast path: install ONLY the missing redis client into the bundled
+    // vendor dir (no root needed, small wheel). The daemon additionally
+    // self-heals at boot, so this is belt-and-suspenders.
+    const vendorPip: string[][] = [
+      ["-m", "pip", "install", "--quiet", "--target", vendor, "redis>=5.0.1"],
+      [
+        "-m", "pip", "install", "--quiet", "--break-system-packages",
+        "--target", vendor, "redis>=5.0.1",
+      ],
+    ];
+    for (const args of vendorPip) {
+      try {
+        execFileSync(py, args, {
+          env: probeEnv,
+          stdio: "pipe",
+          timeout: 180_000,
+        });
+        break;
+      } catch {
+        /* try next variant */
+      }
+    }
+    hasDeps = probeDeps();
   }
 
   if (!hasDeps) {
@@ -86,7 +123,28 @@ export async function register() {
         console.error(`[RVG] pip install failed: ${(e as Error).message}`);
       }
     }
-    if (!hasDeps) console.error("[RVG] continuing without verified deps — daemon may fail");
+    hasDeps = probeDeps();
+    if (!hasDeps)
+      console.error("[RVG] continuing without verified deps — daemon may fail");
+  }
+
+  // ── Restore exec bits on the bundled redis binaries ────────────────────
+  // Some deploy pipelines (zip/tar copy) strip the executable bit; without
+  // it the daemon cannot boot its local Redis and silently falls back to
+  // file storage (panel shows "Redis: disconnected").
+  for (const bin of ["bin/redis-server", "bin/redis-cli"]) {
+    const p = path.join(rvgDir, bin);
+    if (!fs.existsSync(p)) continue;
+    try {
+      fs.accessSync(p, fs.constants.X_OK);
+    } catch {
+      try {
+        fs.chmodSync(p, 0o755);
+        console.log(`[RVG] restored exec bit: ${p}`);
+      } catch {
+        console.error(`[RVG] could not chmod ${p} — daemon will retry`);
+      }
+    }
   }
 
   // ── Spawn the gateway (auto-restart up to 20 times) ───────────────────────

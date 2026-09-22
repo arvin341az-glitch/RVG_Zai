@@ -24,7 +24,9 @@ import sys
 import json
 import time
 import base64
+import shutil
 import socket
+import tempfile
 import subprocess
 from urllib.parse import quote
 
@@ -499,6 +501,91 @@ def _redis_alive(host: str = "127.0.0.1", port: int = REDIS_PORT) -> bool:
         return False
 
 
+def _writable_dir(*candidates: str) -> str | None:
+    """اولین مسیرِ واقعاً قابل‌نوشتن از بین کاندیدها (برای 이미ج‌های read-only)."""
+    for c in candidates:
+        if not c:
+            continue
+        try:
+            os.makedirs(c, exist_ok=True)
+            probe = os.path.join(c, ".rvg_write_test")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.unlink(probe)
+            return c
+        except Exception:
+            continue
+    return None
+
+
+def _find_redis_binary() -> str | None:
+    """پیدا کردن باینری redis-server — شامل ترمیم خودکار exec bit که بعضی
+    پایپ‌لاین‌های دیپلوی موقع کپی حذفش می‌کنند."""
+    candidates = [
+        os.path.join(WORK_DIR, "bin", "redis-server"),              # RVG/bin (توسط setup.sh کپی می‌شود)
+        os.path.join(WORK_DIR, "redis-bin", "redis-server"),        # اجرای مستقیم از داخل RVG
+        os.path.join(WORK_DIR, "..", "redis-bin", "redis-server"),  # اجرای مستقیم از داخل کلون ریپو
+        os.path.expanduser("~/.local/bin/redis-server"),
+        "/usr/local/bin/redis-server",
+        "/usr/bin/redis-server",
+    ]
+    try:
+        which = shutil.which("redis-server")
+        if which:
+            candidates.append(which)
+    except Exception:
+        pass
+    for c in candidates:
+        if not c or not os.path.isfile(c):
+            continue
+        if not os.access(c, os.X_OK):
+            # exec bit حذف شده — ترمیم می‌کنیم (deploy pipeline ها گاهی پرمیژن‌ها را می‌بُرند)
+            try:
+                os.chmod(c, 0o755)
+                print(f"[RVG] restored exec bit on {c}", file=sys.stderr)
+            except Exception:
+                continue
+        if os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def _ensure_redis_pylib() -> bool:
+    """main.py برای صحبت با Redis به پکیج پایتون `redis` نیاز دارد
+    (redis.asyncio). ران‌تایمِ build شده‌ی بعضی پلتفرم‌ها از requirements.txt
+    قدیمی ساخته شده و این پکیج را ندارد. Self-heal: نصب --target داخل اولین
+    مسیر قابل‌نوشتن و اضافه کردن آن به sys.path — قبل از import شدن main."""
+    try:
+        import redis.asyncio  # noqa: F401
+        return True
+    except Exception:
+        pass
+    targets = [
+        os.path.join(WORK_DIR, "vendor"),
+        os.path.join(WORK_DIR, "pylibs"),
+        os.path.join(tempfile.gettempdir(), "rvg-pylibs"),
+    ]
+    for target in targets:
+        td = _writable_dir(target)
+        if not td:
+            continue
+        for extra in ([], ["--break-system-packages"]):
+            cmd = [sys.executable, "-m", "pip", "install", "--quiet",
+                   "--target", td, *extra, "redis>=5.0.1"]
+            try:
+                subprocess.run(cmd, check=True, timeout=180,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if td not in sys.path:
+                    sys.path.insert(0, td)
+                import redis.asyncio  # noqa: F401
+                print(f"[RVG] redis python package self-installed into {td}", file=sys.stderr)
+                return True
+            except Exception:
+                continue
+    print("[RVG] redis python package unavailable — panel falls back to file storage.", file=sys.stderr)
+    return False
+
+
 def _ensure_redis():
     """اگر REDIS_URL از بیرون ست شده باشد (مثلاً Redis افزونه‌ی Railway) از همان
     استفاده می‌شود. وگرنه سعی می‌کند یک Redis محلی را با باینری همراه ریپو
@@ -506,45 +593,43 @@ def _ensure_redis():
     ری‌استارت‌ها ماندگار بماند. اگر هیچ‌کدام نشد، پنل روی فایل محلی (DATA_DIR
     هوشمند) کار می‌کند و هیچ‌چیز نمی‌شکند."""
     if os.environ.get("REDIS_URL", "").strip():
-        print("[RVG] REDIS_URL از محیط ست شده — از Redis خارجی استفاده می‌شود.", file=sys.stderr)
+        print("[RVG] REDIS_URL set in env — using external Redis.", file=sys.stderr)
         return
     if _redis_alive():
         os.environ["REDIS_URL"] = f"redis://127.0.0.1:{REDIS_PORT}/0"
-        print(f"[RVG] Redis محلی روی پورت {REDIS_PORT} از قبل در حال اجراست — استفاده می‌شود.", file=sys.stderr)
+        print(f"[RVG] Redis already running on 127.0.0.1:{REDIS_PORT} — reusing it.", file=sys.stderr)
         return
-    candidates = [
-        os.path.join(WORK_DIR, "bin", "redis-server"),          # RVG/bin (توسط setup.sh کپی می‌شود)
-        os.path.join(WORK_DIR, "..", "redis-bin", "redis-server"),  # اجرای مستقیم از داخل کلون ریپو
-        os.path.expanduser("~/.local/bin/redis-server"),
-        "/usr/local/bin/redis-server",
-        "/usr/bin/redis-server",
-    ]
-    redis_bin = next((c for c in candidates if os.path.isfile(c) and os.access(c, os.X_OK)), None)
+    redis_bin = _find_redis_binary()
     if not redis_bin:
-        print("[RVG] باینری Redis پیدا نشد — ذخیره‌سازی روی فایل محلی (DATA_DIR).", file=sys.stderr)
+        print("[RVG] no redis-server binary found — falling back to local file storage (DATA_DIR).", file=sys.stderr)
         return
-    redis_dir = os.path.join(os.environ.get("DATA_DIR") or WORK_DIR, "redis")
+    # مسیر AOF: اول DATA_DIR، بعد کنار برنامه، آخر /tmp (همیشه قابل نوشتن)
+    redis_dir = _writable_dir(
+        os.path.join(os.environ.get("DATA_DIR") or WORK_DIR, "redis"),
+        os.path.join(WORK_DIR, "redis"),
+        f"{tempfile.gettempdir()}/rvg-redis-{REDIS_PORT}",
+    )
+    if not redis_dir:
+        print("[RVG] no writable dir for Redis AOF — falling back to file storage.", file=sys.stderr)
+        return
     try:
-        os.makedirs(redis_dir, exist_ok=True)
-    except Exception:
-        redis_dir = WORK_DIR
-    try:
-        logf = open(os.path.join(WORK_DIR, "redis.log"), "ab")
+        log_dir = _writable_dir(WORK_DIR, tempfile.gettempdir()) or tempfile.gettempdir()
+        logf = open(os.path.join(log_dir, "redis.log"), "ab")
         subprocess.Popen(
             [redis_bin, "--port", str(REDIS_PORT), "--bind", "127.0.0.1",
              "--dir", redis_dir, "--appendonly", "yes", "--appendfsync", "everysec"],
             stdout=logf, stderr=logf, start_new_session=True,
         )
     except Exception as e:
-        print(f"[RVG] راه‌اندازی Redis ناموفق بود: {e} — فایل محلی.", file=sys.stderr)
+        print(f"[RVG] failed to launch Redis: {e} — falling back to file storage.", file=sys.stderr)
         return
     for _ in range(40):
         if _redis_alive():
             os.environ["REDIS_URL"] = f"redis://127.0.0.1:{REDIS_PORT}/0"
-            print(f"[RVG] Redis محلی روی پورت {REDIS_PORT} بالا آمد — state روی Redis (AOF ماندگار).", file=sys.stderr)
+            print(f"[RVG] local Redis up on port {REDIS_PORT} — state on Redis (AOF persistent).", file=sys.stderr)
             return
         time.sleep(0.25)
-    print("[RVG] Redis پاسخ نداد — فایل محلی.", file=sys.stderr)
+    print("[RVG] Redis did not answer — falling back to file storage.", file=sys.stderr)
 
 
 # ── serve() — shared by sandbox and production ────────────────────────────────
@@ -555,6 +640,9 @@ def serve():
     - production: directly from instrumentation.ts via `python3 daemon.py --serve`
     """
     _ensure_redis()
+    # پکیج پایتون redis هم باید موجود باشد وگرنه REDIS_URL ست می‌شود ولی main
+    # نمی‌تواند وصل شود (aioredis=None). این تابع در صورت نیاز self-heal می‌کند.
+    _ensure_redis_pylib()
 
     # Make sure /data exists (RVG tries to write state there)
     try:

@@ -23,6 +23,8 @@ info() { echo -e "${C}ℹ️  $1${N}"; }
 warn() { echo -e "${Y}⚠️  $1${N}"; }
 
 S="$(cd "$(dirname "$0")" && pwd)"
+RVG_PORT="${RVG_PORT:-3000}"
+export RVG_PORT
 
 echo ""
 echo -e "${C}═══════════════════════════════════════════════════════════════${N}"
@@ -114,24 +116,28 @@ else
     ok "Dependencies installed"
 fi
 
-# ── 9. Free port 3000 (lsof or ss — whichever exists) ─────────────────────────
-info "Freeing port 3000 (if occupied)..."
+# ── 9. Free port (lsof or ss — whichever exists) ──────────────────────────────
+info "Freeing port $RVG_PORT (if occupied)..."
 OLD=""
 if command -v lsof &>/dev/null; then
-    OLD="$(lsof -ti :3000 2>/dev/null || true)"
+    OLD="$(lsof -ti :"$RVG_PORT" 2>/dev/null || true)"
 elif command -v ss &>/dev/null; then
-    OLD="$(ss -tlnp 2>/dev/null | grep ':3000' | grep -oP 'pid=\K[0-9]+' | sort -u | tr '\n' ' ')"
+    OLD="$(ss -tlnp 2>/dev/null | grep ":$RVG_PORT" | grep -oP 'pid=\K[0-9]+' | sort -u | tr '\n' ' ')"
 fi
 if [ -n "$OLD" ]; then
-    warn "Killing old process(es) on :3000 → $OLD"
+    warn "Killing old process(es) on :$RVG_PORT → $OLD"
     kill $OLD 2>/dev/null || true; sleep 2
     kill -9 $OLD 2>/dev/null || true
 fi
 
 # ── 10. Stop stale monitors/daemons, start fresh via supervisor ──────────────
-pkill -f "RVG/run-panel.sh" 2>/dev/null || true
-pkill -f "python3 daemon.py" 2>/dev/null || true
-sleep 1
+# فقط روی پورت استاندارد (3000) فرآیندهای کهنه را سراسری پاک می‌کنیم؛
+# با پورت سفارشی، فقط همان پورت آزاد می‌شود تا به نصب‌های دیگر دست نزنیم.
+if [ "$RVG_PORT" = "3000" ]; then
+    pkill -f "RVG/run-panel.sh" 2>/dev/null || true
+    pkill -f "python3 daemon.py" 2>/dev/null || true
+    sleep 1
+fi
 info "Starting RVG panel (double-fork daemon + monitor + watchdog)..."
 # مانیتور: دیمن را در حالت double-fork بالا می‌آورد (فرزند init → در برابر پاک‌سازی مقاوم)
 # و اگر پنل مرد ظرف ~۳۰ ثانیه دوباره بالا می‌آورد. DATA_DIR داخل خود اسکریپت ست می‌شود.
@@ -145,20 +151,18 @@ sleep 6
 # ── 11. Verify ────────────────────────────────────────────────────────────────
 HC=""
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-    HC="$(curl -s --max-time 2 "http://localhost:3000/health" 2>/dev/null || true)"
+    HC="$(curl -s --max-time 2 "http://localhost:$RVG_PORT/health" 2>/dev/null || true)"
     echo "$HC" | grep -q '"status"' && break
     sleep 2
 done
 if echo "$HC" | grep -q '"status"'; then
-    ok "RVG running on port 3000 → $HC"
+    ok "RVG running on port $RVG_PORT → $HC"
 else
-    warn "Still starting. Check: curl http://localhost:3000/health | log: $R/rvg.log | $R/launcher.log"
+    warn "Still starting. Check: curl http://localhost:$RVG_PORT/health | log: $R/rvg.log | $R/launcher.log"
 fi
 
-if curl -s --max-time 5 -o /dev/null -w "%{http_code}" "http://localhost:81/login" 2>/dev/null | grep -q "200"; then
+if [ "$RVG_PORT" = "3000" ] && curl -s --max-time 5 -o /dev/null -w "%{http_code}" "http://localhost:81/login" 2>/dev/null | grep -q "200"; then
     ok "Gateway → :3000 working (preview panel ready)"
-else
-    warn "Gateway not reaching :3000 yet. Check if Python started."
 fi
 
 echo ""
@@ -167,7 +171,7 @@ echo -e "${G}  🎉 Done! Click Publish — it will work.${N}"
 echo -e "${C}═══════════════════════════════════════════════════════════════${N}"
 echo ""
 echo "  Preview:  via Preview Panel (right side)"
-echo "  Local:    http://localhost:3000"
+echo "  Local:    http://localhost:$RVG_PORT"
 echo "  Password: 123456"
 echo "  Log:      $R/rvg.log   |   launcher: $R/launcher.log   |   redis: $R/redis.log"
 echo "  Data:     $R/data (ماندگار)  |  بکاپ‌ها: $R/backups  |  بازگردانی: bash RVG/restore-backup.sh"
@@ -176,4 +180,5 @@ echo "  Architecture:"
 echo "    DEV:  platform dev service → run-panel.sh (monitor) → daemon.py (double-fork) + redis (AOF)"
 echo "    PROD: instrumentation.ts → daemon.py --serve + redis, Caddy :81 → :3001 (fallback :3000)"
 echo "    Wake-up: sandbox idle → platform restarts dev service → panel auto-boots with data intact"
+echo "    Custom port: RVG_PORT=3010 bash setup.sh  (default 3000)"
 echo ""
