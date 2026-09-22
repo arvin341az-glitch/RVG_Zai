@@ -430,6 +430,7 @@ def add_config_endpoints(main_mod, app):
         except Exception:
             diag["pip_available"] = False
 
+        diag["embedded_redis"] = _embedded_redis_report()
         diag["redis_binary_candidates"] = _redis_binary_report()
         bin_path = _find_redis_binary()
         diag["redis_binary_chosen"] = bin_path
@@ -662,9 +663,107 @@ def _redis_binary_report() -> list:
     return report
 
 
+def _embedded_redis_parts_dir() -> str | None:
+    """پوشه‌ی قطعات جاسازی‌شده‌ی redis-server (فایل‌های py) — چون پایپ‌لاین deploy
+    بعضی پلتفرم‌ها فایل‌های باینری را از ایمیج حذف می‌کند ولی .pyها را نگه می‌دارد."""
+    for d in (os.path.join(WORK_DIR, "vendor", "redisbin"),
+              os.path.join(WORK_DIR, "redisbin"),
+              os.path.join(WORK_DIR, "..", "vendor", "redisbin")):
+        try:
+            if os.path.isdir(d):
+                return d
+        except Exception:
+            continue
+    return None
+
+
+def _embedded_redis_report() -> dict:
+    """گزارش وضعیت قطعات جاسازی‌شده — برای endpoint عیب‌یابی (storage-diag)."""
+    import re as _re
+    pd = _embedded_redis_parts_dir()
+    if not pd:
+        return {"parts_dir": None, "parts": 0}
+    try:
+        parts = sorted(f for f in os.listdir(pd) if _re.fullmatch(r"part_\d+\.py", f))
+        return {"parts_dir": pd, "parts": len(parts)}
+    except Exception as e:
+        return {"parts_dir": pd, "parts": 0, "error": f"{type(e).__name__}: {e}"}
+
+
+def _materialize_embedded_redis() -> str | None:
+    """بازسازی redis-server از قطعات py (gzip+base64) — آخرین لایه‌ی خودترمیمی.
+    خروجی در اولین مسیر قابل‌نوشتن نوشته و اجرایی می‌شود؛ اگر از قبل ساخته شده
+    باشد همان مسیر برمی‌گردد (idempotent)."""
+    import base64
+    import gzip
+    import hashlib
+    import re as _re
+
+    rep = _embedded_redis_report()
+    if not rep.get("parts"):
+        return None
+    pd = rep["parts_dir"]
+    target_dir = _writable_dir(
+        os.path.join(WORK_DIR, "bin"),
+        os.path.join(tempfile.gettempdir(), "rvg-bin"),
+    )
+    if not target_dir:
+        return None
+    target = os.path.join(target_dir, "redis-server")
+    try:
+        if os.path.isfile(target) and os.path.getsize(target) > 1_000_000 \
+                and os.access(target, os.X_OK):
+            return target  # از قبل بازسازی شده
+        chunks = []
+        for name in sorted(f for f in os.listdir(pd) if _re.fullmatch(r"part_\d+\.py", f)):
+            with open(os.path.join(pd, name), "r", encoding="utf-8") as fh:
+                m = _re.search(r'R\s*=\s*"""(.*?)"""', fh.read(), _re.S)
+            if not m or not m.group(1).strip():
+                print(f"[RVG] embedded redis part {name} is corrupt — materialization aborted.", file=sys.stderr)
+                return None
+            chunks.append(m.group(1).strip())
+        raw = gzip.decompress(base64.b64decode("".join(chunks)))
+        # صحت‌سنجی md5 در صورت وجود part_meta.py
+        md5_ok = None
+        try:
+            meta_path = os.path.join(pd, "part_meta.py")
+            if os.path.isfile(meta_path):
+                meta: dict = {}
+                with open(meta_path, "r", encoding="utf-8") as fh:
+                    code = fh.read()
+                for line in code.splitlines():
+                    line = line.strip()
+                    if line.startswith("MD5"):
+                        meta["md5"] = line.split("=", 1)[1].strip().strip('"')
+                    elif line.startswith("SIZE"):
+                        try:
+                            meta["size"] = int(line.split("=", 1)[1].strip())
+                        except ValueError:
+                            pass
+                actual = hashlib.md5(raw).hexdigest()
+                md5_ok = (meta.get("md5") == actual)
+                if meta.get("size"):
+                    md5_ok = md5_ok and meta.get("size") == len(raw)
+                if not md5_ok:
+                    print(f"[RVG] embedded redis md5 mismatch ({actual}) — aborting.", file=sys.stderr)
+                    return None
+        except Exception:
+            pass
+        with open(target, "wb") as fh:
+            fh.write(raw)
+        os.chmod(target, 0o755)
+        print(f"[RVG] redis-server materialized from embedded py-parts (md5_ok={md5_ok}) → {target}", file=sys.stderr)
+        return target
+    except Exception as e:
+        print(f"[RVG] embedded redis materialization failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
+
+
 def _find_redis_binary() -> str | None:
     """اولین باینری موجود. اجرایی‌ها اولویت دارند؛ اگر هیچ‌کدام اجرایی نبود همان
-    مسیر برمی‌گردد — _ensure_redis موقع spawn مشکل exec را دور می‌زند (کپی به tmp)."""
+    مسیر برمی‌گردد — _ensure_redis موقع spawn مشکل exec را دور می‌زند (کپی به tmp).
+    اگر هیچ باینری‌ای روی دیسک نبود (deploy باینری‌ها را حذف کرده)، از قطعات
+    py جاسازی‌شده بازسازی می‌شود."""
     report = _redis_binary_report()
     exec_ok = next((r["path"] for r in report if r["exec_ok"]), None)
     if exec_ok:
@@ -675,7 +774,8 @@ def _find_redis_binary() -> str | None:
             os.chmod(exists_any, 0o755)
         except Exception:
             pass
-    return exists_any
+        return exists_any
+    return _materialize_embedded_redis()
 
 
 def _spawn_redis(bin_path: str, redis_dir: str, logf=None) -> None:

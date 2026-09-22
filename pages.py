@@ -3471,7 +3471,7 @@ async function fetchStats(){
     if(redisEl){
       if(d.redis_connected){redisEl.style.color='var(--green-t)';redisEl.textContent='● متصل';}
       else if(d.redis_configured){redisEl.style.color='var(--red-t)';redisEl.textContent='● وصل نیست (فایل محلی جایگزین)';}
-      else{redisEl.style.color='var(--t3)';redisEl.textContent='تنظیم نشده';}
+      else{redisEl.style.color='var(--red-t)';redisEl.innerHTML='تنظیم نشده <a href="/api/storage-diag" target="_blank" style="font-size:10px;color:var(--t3);text-decoration:underline;margin-right:4px">(عیب‌یابی ذخیره‌سازی)</a>';}
     }
     if(storageEl)storageEl.textContent=d.redis_connected?'Redis':'JSON File (/data)';
     document.getElementById('last-upd').textContent='آخرین بروزرسانی: '+new Date().toLocaleTimeString('fa-IR');

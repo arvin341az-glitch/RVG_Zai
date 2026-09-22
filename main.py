@@ -27,6 +27,8 @@ def _install_packages():
 
 # _install_packages()  # deps preinstalled for local test
 
+PANEL_VERSION = "9.2.3-embed"
+
 import asyncio
 import contextvars
 import json
@@ -969,7 +971,8 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "connections": len(connections), "uptime": uptime()}
+    return {"status": "ok", "connections": len(connections), "uptime": uptime(),
+            "panel_version": PANEL_VERSION}
 
 # ── Subscription (single link) ────────────────────────────────────────────────
 @app.get("/sub/{uuid}")
@@ -1411,6 +1414,7 @@ async def get_stats(_=Depends(require_auth)):
         "redis_configured": bool(REDIS_URL),
         "redis_connected": REDIS_CONNECTED,
         "storage_backend": "redis" if REDIS_CONNECTED else "file",
+        "panel_version": PANEL_VERSION,
     }
 
 @app.get("/api/bot-tcp-proxy/domains")
