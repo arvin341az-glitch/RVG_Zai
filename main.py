@@ -27,7 +27,7 @@ def _install_packages():
 
 # _install_packages()  # deps preinstalled for local test
 
-PANEL_VERSION = "9.2.3-embed"
+PANEL_VERSION = "9.2.4-remote"
 
 import asyncio
 import contextvars
@@ -290,7 +290,7 @@ def apply_logging_state():
 
 
 async def load_state():
-    global LINKS, AUTH, SUBS
+    global LINKS, AUTH, SUBS, STATE_SEQ
     data = None
     loaded_from = None
     try:
@@ -332,25 +332,45 @@ async def load_state():
                 AUTH["password_hash_v2"] = data["password_hash_v2"]
             CONFIG["disable_logging"] = bool(data.get("disable_logging", False))
             apply_logging_state()
+            try:
+                STATE_SEQ = max(STATE_SEQ, int(data.get("seq") or 0))
+            except Exception:
+                pass
             logger.info(
                 f"State loaded from {loaded_from}: {len(LINKS)} links, {len(SUBS)} subs, "
-                f"{len(NODES)} nodes, {len(NODE_KEYS)} node keys"
+                f"{len(NODES)} nodes, {len(NODE_KEYS)} node keys (seq={STATE_SEQ})"
             )
     except Exception as e:
         logger.warning(f"Could not load state: {e}")
 
+def _state_payload() -> dict:
+    """اسنپ‌شات کامل state برای ذخیره‌سازی روی Redis/فایل/gist.
+    شامل secret و sessions هم هست تا یک کانتینر تازه‌سازی‌شده بتواند دقیقاً
+    از همین نسخه احیا شود (رمز ادمین، نشست مرورگر، کانفیگ‌ها)."""
+    try:
+        sessions = {t: e for t, e in SESSIONS.items() if e > time.time()}
+    except Exception:
+        sessions = {}
+    return {
+        "links": dict(LINKS),
+        "subs": dict(SUBS),
+        "node_keys": dict(NODE_KEYS),
+        "nodes": dict(NODES),
+        "password_hash": AUTH["password_hash"],
+        "password_hash_v2": AUTH.get("password_hash_v2"),
+        "disable_logging": CONFIG.get("disable_logging", False),
+        "secret": CONFIG["secret"],
+        "sessions": sessions,
+        "seq": STATE_SEQ,
+        "saved_at": datetime.now().isoformat(),
+    }
+
+
 async def save_state():
+    global STATE_SEQ
     async with SAVE_LOCK:
-        data = {
-            "links": dict(LINKS),
-            "subs": dict(SUBS),
-            "node_keys": dict(NODE_KEYS),
-            "nodes": dict(NODES),
-            "password_hash": AUTH["password_hash"],
-            "password_hash_v2": AUTH.get("password_hash_v2"),
-            "disable_logging": CONFIG.get("disable_logging", False),
-            "saved_at": datetime.now().isoformat(),
-        }
+        STATE_SEQ += 1
+        data = _state_payload()
         wrote_to_redis = False
         if REDIS_CONNECTED and redis_client:
             try:
@@ -365,6 +385,8 @@ async def save_state():
         except Exception as e:
             if not wrote_to_redis:
                 logger.warning(f"Could not save state: {e}")
+    if REMOTE["enabled"]:
+        schedule_remote_push()
 
 
 # ── Debounced save ─────────────────────────────────────────────────────────────
@@ -395,6 +417,228 @@ async def schedule_save():
                 break
     finally:
         _save_pending = False
+
+# ── Remote State Sync (GitHub secret gist) ────────────────────────────────────
+# مشکل ریشه‌ای: روی پلتفرم‌هایی که کانتینرشان موقتی است (مثل نسخه‌ی published
+# همین پنل)، هر ری‌استارت/بازسازی کانتینر یعنی پاک شدن کل دیسک؛ Redis داخلی و
+# فایل state هر دو روی همان دیسک موقتی زندگی می‌کنند و نجات پیدا نمی‌کنند. نتیجه:
+# رمز ادمین به پیش‌فرض برمی‌گردد، کانفیگ‌های ساخته‌شده پاک می‌شوند و کاربر از پنل
+# بیرون انداخته می‌شود — دقیقاً بعد از تست سرعت/ترافیک سنگین که پلتفرم را به
+# ری‌استارت وامی‌دارد.
+# راه‌حل: کل state (رمز، نشست‌ها، کانفیگ‌ها) به‌صورت یک secret gist روی GitHub
+# ذخیره می‌شود. هنگام بوت، نسخه‌ی جدیدتر (بر اساس شماره‌ی ترتیبی seq) بین
+# دیسک/Redis و gist برنده می‌شود و بعد از هر تغییر، push دِبونس‌شده انجام می‌شود.
+# توکن از فایل rvg_remote.py کنار main.py خوانده می‌شود (چون فقط فایل‌های .py از
+# فیلترهای دیپلوی جان سالم به در می‌برند). بدون توکن، پنل مثل قبل فقط محلی کار
+# می‌کند. با RVG_REMOTE_SYNC=0 می‌توان آن را برای یک اینستنس غیرفعال کرد (مثلاً
+# پیش‌نمایش سندباکس که نباید با نسخه‌ی published روی یک gist بجنگد).
+
+try:
+    from rvg_remote import (  # type: ignore
+        GITHUB_TOKEN as _REMOTE_TOKEN,
+        GIST_ID as _REMOTE_GIST_ID,
+        ENABLED as _REMOTE_ENABLED,
+        PUSH_DEBOUNCE_SECONDS as _REMOTE_DEBOUNCE,
+    )
+except Exception:
+    _REMOTE_TOKEN, _REMOTE_GIST_ID, _REMOTE_ENABLED = "", "", True
+    _REMOTE_DEBOUNCE = 15.0
+
+GIST_FILENAME = "rvg_state.json"
+GIST_DESCRIPTION = "RVG-Gateway-State (do not delete)"
+GITHUB_API = "https://api.github.com"
+
+REMOTE = {
+    "enabled": bool(_REMOTE_TOKEN) and bool(_REMOTE_ENABLED)
+    and os.environ.get("RVG_REMOTE_SYNC", "1") != "0",
+    "gist_id": _REMOTE_GIST_ID or "",
+    "last_pull": None,
+    "last_push": None,
+    "last_error": None,
+}
+STATE_SEQ = 0
+_remote_push_pending = False
+_remote_push_dirty = False
+_gist_client: Optional[httpx.AsyncClient] = None
+
+
+def _remote_headers() -> dict:
+    return {
+        "Authorization": f"token {_REMOTE_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "RVG-Gateway",
+    }
+
+
+async def _remote_client() -> httpx.AsyncClient:
+    global _gist_client
+    if _gist_client is None or _gist_client.is_closed:
+        _gist_client = httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=6.0))
+    return _gist_client
+
+
+async def _gist_find_id() -> Optional[str]:
+    """gist ذخیره‌ی state را پیدا می‌کند: اول id تنظیم‌شده، بعد جستجو بین gist های
+    اکانت بر اساس نام فایل — چون gist_id روی دیسک موقتی گم می‌شود."""
+    if REMOTE["gist_id"]:
+        return REMOTE["gist_id"]
+    client = await _remote_client()
+    r = await client.get(f"{GITHUB_API}/gists", headers=_remote_headers(),
+                         params={"per_page": 100})
+    if r.status_code != 200:
+        raise RuntimeError(f"gist list HTTP {r.status_code}")
+    for g in r.json():
+        if GIST_FILENAME in (g.get("files") or {}):
+            REMOTE["gist_id"] = g["id"]
+            return g["id"]
+    return None
+
+
+async def remote_pull() -> Optional[dict]:
+    """state ذخیره‌شده روی gist را می‌خواند (None = gist هنوز وجود ندارد)."""
+    gist_id = await _gist_find_id()
+    if not gist_id:
+        return None
+    client = await _remote_client()
+    r = await client.get(f"{GITHUB_API}/gists/{gist_id}", headers=_remote_headers())
+    if r.status_code == 404:
+        REMOTE["gist_id"] = ""
+        return None
+    if r.status_code != 200:
+        raise RuntimeError(f"gist get HTTP {r.status_code}")
+    REMOTE["gist_id"] = gist_id
+    content = ((r.json().get("files") or {}).get(GIST_FILENAME) or {}).get("content")
+    if not content:
+        return None
+    REMOTE["last_pull"] = datetime.now().isoformat()
+    return json.loads(content)
+
+
+async def remote_push() -> bool:
+    """state فعلی را روی gist می‌نویسد (اگر نداشته باشد می‌سازد)."""
+    if not REMOTE["enabled"] or not _REMOTE_TOKEN:
+        return False
+    content = json.dumps(_state_payload(), ensure_ascii=False)
+    client = await _remote_client()
+    gist_id = REMOTE["gist_id"] or await _gist_find_id()
+    body = {"description": GIST_DESCRIPTION,
+            "files": {GIST_FILENAME: {"content": content}}}
+    if gist_id:
+        r = await client.patch(f"{GITHUB_API}/gists/{gist_id}",
+                               headers=_remote_headers(), json=body)
+        if r.status_code == 404:
+            gist_id = ""  # gist حذف شده — دوباره ساخته می‌شود
+        else:
+            r.raise_for_status()
+    if not gist_id:
+        r = await client.post(f"{GITHUB_API}/gists", headers=_remote_headers(),
+                              json={**body, "public": False})
+        r.raise_for_status()
+        REMOTE["gist_id"] = r.json().get("id") or ""
+    REMOTE["last_push"] = datetime.now().isoformat()
+    REMOTE["last_error"] = None
+    logger.info("State pushed to remote gist (backup برای ری‌استارت کانتینر).")
+    return True
+
+
+async def _remote_push_loop():
+    global _remote_push_pending, _remote_push_dirty
+    try:
+        while True:
+            _remote_push_dirty = False
+            await asyncio.sleep(max(3.0, float(_REMOTE_DEBOUNCE or 15.0)))
+            try:
+                await remote_push()
+            except Exception as e:
+                REMOTE["last_error"] = f"{type(e).__name__}: {e}"
+                logger.warning(f"remote push failed: {e}")
+            if not _remote_push_dirty:
+                break
+    finally:
+        _remote_push_pending = False
+
+
+def schedule_remote_push():
+    """push دِبونس‌شده به gist — امن برای صدا زدن مکرر بعد از هر save_state."""
+    global _remote_push_pending, _remote_push_dirty
+    if not REMOTE["enabled"]:
+        return
+    if _remote_push_pending:
+        _remote_push_dirty = True
+        return
+    _remote_push_pending = True
+    asyncio.create_task(_remote_push_loop())
+
+
+def _apply_remote_state(data: dict) -> None:
+    """state خوانده‌شده از gist را جایگزین state فعلی در حافظه می‌کند (remote = حقیقت جدیدتر)."""
+    global STATE_SEQ
+    if not isinstance(data, dict):
+        return
+    LINKS.clear()
+    LINKS.update(data.get("links", {}) or {})
+    SUBS.clear()
+    SUBS.update(data.get("subs", {}) or {})
+    NODE_KEYS.clear()
+    NODE_KEYS.update(data.get("node_keys", {}) or {})
+    NODES.clear()
+    NODES.update(data.get("nodes", {}) or {})
+    if data.get("password_hash"):
+        AUTH["password_hash"] = data["password_hash"]
+    if data.get("password_hash_v2"):
+        AUTH["password_hash_v2"] = data["password_hash_v2"]
+    if data.get("secret"):
+        CONFIG["secret"] = str(data["secret"])
+    try:
+        now = time.time()
+        sess = data.get("sessions") or {}
+        SESSIONS.update({t: e for t, e in sess.items()
+                         if isinstance(e, (int, float)) and e > now})
+    except Exception:
+        pass
+    CONFIG["disable_logging"] = bool(data.get("disable_logging", False))
+    apply_logging_state()
+    try:
+        STATE_SEQ = max(STATE_SEQ, int(data.get("seq") or 0))
+    except Exception:
+        pass
+
+
+async def remote_boot_sync():
+    """موقع بوت: نسخه‌ی جدیدتر بین state محلی و gist برنده می‌شود.
+      - gist جدیدتر بود → state محلی/در-RAM با gist جایگزین و روی دیسک/Redis نوشته می‌شود.
+      - محلی جدیدتر بود (یا gist نبود) → state محلی به gist pushed می‌شود.
+    با ۳ تلاش؛ اگر GitHub در دسترس نبود، بوت با state محلی ادامه پیدا می‌کند."""
+    if not REMOTE["enabled"]:
+        logger.info("Remote state sync غیرفعال است (rvg_remote.py بدون توکن یا RVG_REMOTE_SYNC=0).")
+        return
+    for attempt in range(3):
+        try:
+            data = await remote_pull()
+            if data is None:
+                logger.info("gist remote پیدا نشد — state فعلی به‌عنوان اولین نسخه pushed می‌شود.")
+                await remote_push()
+                return
+            remote_seq = int(data.get("seq") or 0)
+            local_seq = STATE_SEQ
+            if remote_seq > local_seq:
+                _apply_remote_state(data)
+                logger.info(
+                    f"State از gist بازیابی شد (remote seq={remote_seq} > local seq={local_seq}) — "
+                    f"{len(LINKS)} links, {len(SUBS)} subs؛ رمز و نشست‌ها حفظ شدند."
+                )
+                await save_state()
+            else:
+                logger.info(
+                    f"State محلی جدیدتر یا هم‌سان است (local seq={local_seq} >= remote seq={remote_seq}) — push به gist."
+                )
+                await remote_push()
+            return
+        except Exception as e:
+            REMOTE["last_error"] = f"{type(e).__name__}: {e}"
+            logger.warning(f"remote boot sync تلاش {attempt + 1}/3 ناموفق: {e}")
+            await asyncio.sleep(2)
 
 # ── In-memory state ───────────────────────────────────────────────────────────
 connections: dict = {}
@@ -551,6 +795,11 @@ async def startup():
         asyncio.create_task(redis_watchdog())
     await load_state()
     await _load_sessions()
+    if REMOTE["enabled"]:
+        try:
+            await asyncio.wait_for(remote_boot_sync(), timeout=30.0)
+        except Exception as e:
+            logger.warning(f"remote boot sync skipped/failed: {e}")
     await _restart_mtproto_instances()
     log_activity("system", "سرور راه‌اندازی شد", "ok")
     logger.info(f"RVG Gateway v9.2 started on port {CONFIG['port']}")
@@ -723,6 +972,11 @@ async def _update_mtproto_ad_tag(uuid: str, ad_tag: str):
 @app.on_event("shutdown")
 async def shutdown():
     await save_state()
+    try:
+        if REMOTE["enabled"]:
+            await asyncio.wait_for(remote_push(), timeout=8.0)
+    except Exception as e:
+        logger.warning(f"remote push on shutdown failed: {e}")
     await mtproto.stop_all()
     if http_client:
         await http_client.aclose()
@@ -1349,7 +1603,13 @@ async def api_me(request: Request):
 @app.post("/api/change-password")
 async def api_change_password(request: Request, token=Depends(require_auth)):
     body = await request.json()
-    if hash_password(str(body.get("current_password", ""))) != AUTH["password_hash"]:
+    cur = str(body.get("current_password", ""))
+    ok_cur = False
+    if AUTH.get("password_hash_v2"):
+        ok_cur = hash_password_v2(cur) == AUTH["password_hash_v2"]
+    if not ok_cur and AUTH.get("password_hash"):
+        ok_cur = hash_password(cur) == AUTH["password_hash"]
+    if not ok_cur:
         raise HTTPException(status_code=400, detail="رمز فعلی اشتباه است")
     new = str(body.get("new_password", ""))
     if len(new) < 4:

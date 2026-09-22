@@ -18,6 +18,7 @@ from main import (
     error_logs,
     logger,
     save_state,
+    schedule_save,
     log_activity,
 )
 from protocol.vless.vless import check_and_use, _QuotaGate
@@ -189,7 +190,7 @@ async def shadowsocks_ws_tunnel(ws: WebSocket):
             except asyncio.CancelledError:
                 pass
 
-        asyncio.create_task(save_state())
+        asyncio.create_task(schedule_save())
 
     except WebSocketDisconnect:
         pass

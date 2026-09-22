@@ -465,6 +465,18 @@ def add_config_endpoints(main_mod, app):
         diag["redis_connected"] = bool(main_mod.REDIS_CONNECTED)
         diag["storage_backend"] = "redis" if main_mod.REDIS_CONNECTED else "file"
         diag["links_count"] = len(main_mod.LINKS)
+        try:
+            rem = getattr(main_mod, "REMOTE", None)
+            diag["remote_sync"] = {
+                "enabled": bool(rem and rem.get("enabled")),
+                "gist_id": (rem or {}).get("gist_id") or None,
+                "last_pull": (rem or {}).get("last_pull"),
+                "last_push": (rem or {}).get("last_push"),
+                "last_error": (rem or {}).get("last_error"),
+                "seq": int(getattr(main_mod, "STATE_SEQ", 0) or 0),
+            }
+        except Exception:
+            pass
 
         try:
             entries = sorted(e.name + ("/" if e.is_dir() else "")

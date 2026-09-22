@@ -17,6 +17,9 @@ export RVG_PORT="${RVG_PORT:-3000}"
 export RVG_LOG_FILE="$RVG_DIR/rvg.log"
 export DATA_DIR="$RVG_DIR/data"          # writable persistent storage (NOT /data)
 export PYTHONUNBUFFERED=1
+# پیش‌نمایش/نصب محلی: sync ابری state به gist پیش‌فرض خاموش است تا با نسخه‌ی
+# published روی یک gist نجنگد. برای فعال‌سازی: RVG_REMOTE_SYNC=1
+export RVG_REMOTE_SYNC="${RVG_REMOTE_SYNC:-0}"
 
 BACKUP_DIR="$RVG_DIR/backups"
 LAUNCHER_LOG="$RVG_DIR/launcher.log"

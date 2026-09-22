@@ -48,6 +48,9 @@ R="$P/RVG"; mkdir -p "$R"
 for f in daemon.py main.py central.py pages.py updater.py botgeneratedomin.py bottokentcpproxy.py zeussocks5.py requirements.txt run-panel.sh watchdog.sh restore-backup.sh; do
     [ -f "$S/$f" ] && cp "$S/$f" "$R/"
 done
+# rvg_remote.py (توکن sync ابری state) فقط اگر از قبل نبود کپی شود —
+# تا توکن/تنظیماتی که کاربر داخلش گذاشته با نصب مجدد پاک نشوند.
+[ -f "$R/rvg_remote.py" ] || { [ -f "$S/rvg_remote.py" ] && cp "$S/rvg_remote.py" "$R/"; }
 [ -d "$S/protocol" ] && cp -r "$S/protocol" "$R/"
 # Redis همراه ریپو → RVG/bin (daemon.py خودش پیدایش می‌کند و با AOF بالا می‌آورد)
 if [ -d "$S/redis-bin" ]; then

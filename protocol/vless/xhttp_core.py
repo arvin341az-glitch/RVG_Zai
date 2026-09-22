@@ -30,6 +30,7 @@ from main import (
     logger,
     is_link_allowed,
     save_state,
+    schedule_save,
 )
 from protocol.vless.vless import parse_vless_header, check_and_use
 
@@ -375,7 +376,7 @@ async def _open_tcp_for_session(session_id: str, uuid: str, sess: dict, first_ch
     sess["downlink_task"] = asyncio.create_task(
         _pump_tcp_to_queue(session_id, uuid, reader, sess["down_q"], vless_prefix=vless_prefix, conn_id=sess["conn_id"])
     )
-    asyncio.create_task(save_state())
+    asyncio.create_task(schedule_save())
 
 
 def _downstream_gen(sess: dict):

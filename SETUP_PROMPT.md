@@ -67,6 +67,26 @@ that. Free options: Upstash (serverless, TLS).
 3. Restart the panel (or re-publish). From now on ALL panel state is stored on
    that external Redis and survives everything: restarts, idle wake-ups AND redeploys.
 
+## Cloud State Backup (GitHub gist) — v9.2.4+
+
+Even without external Redis, the panel can now back up its ENTIRE state (admin
+password, browser sessions, links, subs) to a **secret GitHub gist**:
+
+- On every boot the panel compares local state with the gist; the NEWER one wins
+  (version counter `seq`). So a container restart / rebuild / wiped disk can no
+  longer reset the password or delete configs.
+- After every change the state is pushed to the gist (debounced 15s).
+- To enable: create a GitHub **classic token with `gist` scope**, then put it in
+  `RVG/rvg_remote.py`:
+  ```python
+  GITHUB_TOKEN = "ghp_xxxxxxxxxxxx"
+  ```
+  No other step — the gist is auto-created/auto-found by filename.
+- Disable for one instance with env `RVG_REMOTE_SYNC=0` (the bundled
+  `run-panel.sh` sets this for local/preview so two instances never fight over
+  one gist).
+- Status is visible at `GET /api/storage-diag` → `remote_sync`.
+
 ## Manual Setup
 
 ```bash
