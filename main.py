@@ -195,6 +195,20 @@ async def init_redis():
         redis_client = client
         REDIS_CONNECTED = True
         logger.info("Redis متصل شد — ذخیره‌سازی state از این به بعد روی Redis انجام می‌شود.")
+        # همگام‌سازی SECRET_KEY با Redis — قبل از load_state اجرا می‌شود تا
+        # هشِ legacy رمز (که با secret زمان ذخیره ساخته شده) قابل‌تأیید بماند و
+        # نشست‌های ذخیره‌شده هم بین ری‌استارت‌ها/کانتینرها معتبر بمانند.
+        try:
+            stored = await client.get("rvg:secret")
+            if stored:
+                stored = str(stored)
+                if stored != CONFIG["secret"]:
+                    CONFIG["secret"] = stored
+                    logger.info("SECRET_KEY از Redis بازیابی شد — نشست‌های قبلی معتبر می‌مانند.")
+            else:
+                await client.set("rvg:secret", CONFIG["secret"])
+        except Exception as e:
+            logger.warning(f"همگام‌سازی SECRET_KEY با Redis ناموفق بود: {e}")
     except Exception as e:
         redis_client = None
         REDIS_CONNECTED = False
@@ -314,6 +328,8 @@ async def load_state():
                 NODES[nid] = _normalize_node(n)
             if "password_hash" in data:
                 AUTH["password_hash"] = data["password_hash"]
+            if "password_hash_v2" in data:
+                AUTH["password_hash_v2"] = data["password_hash_v2"]
             CONFIG["disable_logging"] = bool(data.get("disable_logging", False))
             apply_logging_state()
             logger.info(
@@ -331,6 +347,7 @@ async def save_state():
             "node_keys": dict(NODE_KEYS),
             "nodes": dict(NODES),
             "password_hash": AUTH["password_hash"],
+            "password_hash_v2": AUTH.get("password_hash_v2"),
             "disable_logging": CONFIG.get("disable_logging", False),
             "saved_at": datetime.now().isoformat(),
         }
@@ -443,18 +460,55 @@ def log_activity(kind: str, message: str, level: str = "info"):
 # ── Auth ──────────────────────────────────────────────────────────────────────
 SESSION_COOKIE = "rvg_session"
 SESSION_TTL = 60 * 60 * 24 * 7
+REDIS_SESSIONS_KEY = "rvg:sessions"
+
+_ADMIN_SALT = "RVG::admin::v2::fixed-salt"
 
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
-AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "123456"))}
+def hash_password_v2(pw: str) -> str:
+    """هش رمز ادمین با نمک ثابت — مستقل از SECRET_KEY. تا اگر secret بین
+    ری‌استارت‌ها/کانتینرها عوض شد، رمز تغییرکرده باطل نشود."""
+    return hashlib.sha256(f"{_ADMIN_SALT}::{pw}".encode()).hexdigest()
+
+AUTH = {
+    "password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "123456")),
+    "password_hash_v2": hash_password_v2(os.environ.get("ADMIN_PASSWORD", "123456")),
+}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
+
+async def _persist_sessions():
+    """ذخیره‌ی نشست‌های فعال در Redis (best-effort) — تا ری‌استارت پنل، کاربر
+    از پنل بیرون انداخته نشود."""
+    try:
+        if REDIS_CONNECTED and redis_client:
+            async with SESSIONS_LOCK:
+                payload = json.dumps({t: e for t, e in SESSIONS.items() if e > time.time()})
+            await redis_client.set(REDIS_SESSIONS_KEY, payload)
+    except Exception as e:
+        logger.debug(f"persist sessions failed: {e}")
+
+async def _load_sessions():
+    """بازیابی نشست‌های فعال از Redis بعد از ری‌استارت."""
+    try:
+        if REDIS_CONNECTED and redis_client:
+            raw = await redis_client.get(REDIS_SESSIONS_KEY)
+            if raw:
+                data = json.loads(raw)
+                now = time.time()
+                async with SESSIONS_LOCK:
+                    SESSIONS.update({t: e for t, e in data.items() if isinstance(e, (int, float)) and e > now})
+                logger.info(f"{len(data)} نشست فعال از Redis بازیابی شد — کاربران لازم نیست دوباره لاگین کنند.")
+    except Exception as e:
+        logger.debug(f"load sessions failed: {e}")
 
 async def create_session() -> str:
     token = secrets.token_urlsafe(32)
     async with SESSIONS_LOCK:
         SESSIONS[token] = time.time() + SESSION_TTL
+    await _persist_sessions()
     return token
 
 async def is_valid_session(token: str | None) -> bool:
@@ -474,6 +528,7 @@ async def destroy_session(token: str | None):
         return
     async with SESSIONS_LOCK:
         SESSIONS.pop(token, None)
+    await _persist_sessions()
 
 async def require_auth(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
@@ -495,6 +550,7 @@ async def startup():
     if REDIS_URL:
         asyncio.create_task(redis_watchdog())
     await load_state()
+    await _load_sessions()
     await _restart_mtproto_instances()
     log_activity("system", "سرور راه‌اندازی شد", "ok")
     logger.info(f"RVG Gateway v9.2 started on port {CONFIG['port']}")
@@ -1263,9 +1319,16 @@ async def sub_group_subscription(uuid_key: str, request: Request):
 async def api_login(request: Request):
     body = await request.json()
     ip = client_ip(request)
-    if hash_password(str(body.get("password", ""))) != AUTH["password_hash"]:
+    pw = str(body.get("password", ""))
+    legacy_ok = hash_password(pw) == AUTH["password_hash"]
+    v2_ok = bool(AUTH.get("password_hash_v2")) and hash_password_v2(pw) == AUTH["password_hash_v2"]
+    if not (legacy_ok or v2_ok):
         log_activity("auth", f"تلاش ورود ناموفق از {ip}", "err")
         raise HTTPException(status_code=401, detail="رمز عبور اشتباه است")
+    if not v2_ok:
+        # مهاجرت خودکار به هش v2 (مستقل از secret) — یک‌بار، بعد از اولین ورود موفق
+        AUTH["password_hash_v2"] = hash_password_v2(pw)
+        await save_state()
     token = await create_session()
     log_activity("auth", f"ورود موفق به پنل از {ip}", "ok")
     resp = JSONResponse({"ok": True})
@@ -1292,6 +1355,7 @@ async def api_change_password(request: Request, token=Depends(require_auth)):
     if len(new) < 4:
         raise HTTPException(status_code=400, detail="رمز جدید باید حداقل ۴ کاراکتر باشد")
     AUTH["password_hash"] = hash_password(new)
+    AUTH["password_hash_v2"] = hash_password_v2(new)
     async with SESSIONS_LOCK:
         SESSIONS.clear()
         SESSIONS[token] = time.time() + SESSION_TTL
