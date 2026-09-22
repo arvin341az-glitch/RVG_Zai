@@ -5,46 +5,50 @@ Clone and run the RVG Gateway proxy panel with a single command.
 ## Quick Start (paste this to any AI assistant)
 
 ```
-Clone the repository https://github.com/ggabhdnfj/RVG_chatZ.git and run the RVG Gateway proxy panel.
+سلام. تو دستیار فنی هستی و مأموریت تو نصب و راه‌اندازی «پنل RVG Gateway v9.2» روی این محیط است.
 
-Steps (exactly this order):
-1. Clone INSIDE the Next.js project folder (the one containing package.json):
-   git clone https://github.com/ggabhdnfj/RVG_chatZ.git
-2. Run the one-command setup:
-   cd RVG_chatZ && bash setup.sh
+ریپو: https://github.com/ggabhdnfj/RVG_chatZ.git
 
-That's it. setup.sh does everything:
-- Copies the Python app to RVG/ (including run-panel.sh, watchdog.sh, restore-backup.sh)
-- Copies the bundled Redis (redis-bin/ → RVG/bin) — the panel auto-starts it with AOF persistence
-- Wires package.json "dev" script to RVG/run-panel.sh (platform wake-ups auto-boot the panel)
-- Installs Python deps (fastapi, uvicorn, redis, ...)
-- Frees port 3000 (lsof or ss), starts the panel as a double-fork daemon + monitor
-- Verifies http://localhost:3000/health
+دقیقاً مراحل زیر را به همین ترتیب انجام بده. هیچ سوالی نپرس و هیچ فایلی از ریپو را ویرایش یا حذف نکن.
 
-Notes for the AI:
-- Do NOT ask questions, do NOT run `bun run build`.
-- The panel replaces the Next.js dev server on port 3000 (page.tsx becomes a redirect stub).
-- If port 3000 is busy: lsof -ti :3000 | xargs kill -9, or ss -tlnp | grep :3000 → kill PID.
-- Data persists in RVG/data (state json + secret) and in bundled Redis (AOF) — nothing is wiped on restarts.
-- Rotating backups live in RVG/backups; restore with: bash RVG/restore-backup.sh [file] [--restart]
-- To use an external Redis (e.g. Upstash / Railway plugin): set REDIS_URL env,
-  OR create RVG/external_redis.txt containing the connection URL (one line).
-  The file takes effect at every boot — survives redeploys because it ships with the project.
-- Storage diagnostics endpoint (auth required): GET /api/storage-diag — reports
-  redis client/binary status, exec tests, writable dirs. Use it when the published
-  app shows Redis disconnected.
+مرحله ۱ — دانلود پروژه:
+git clone https://github.com/ggabhdnfj/RVG_chatZ.git
+cd RVG_chatZ
+(اگر داخل یک پروژه Next.js هستی، ریپو را داخل همان پوشه‌ای کلون کن که package.json دارد.)
 
-After setup completes, open http://localhost:3000 in your browser.
-Login with password: 123456
+مرحله ۲ — نصب، فقط با یک دستور:
+bash setup.sh
+- پیش‌فرض پنل روی پورت 3000 بالا می‌آید. اگر پورت دیگری می‌خواهی: RVG_PORT=3010 bash setup.sh
+- این اسکریپت خودش همه‌چیز را انجام می‌دهد: نصب وابستگی‌های پایتون، کپی فایل‌ها، راه‌اندازی Redis همراه (با AOF ماندگار)، مانیتور keep-alive و بکاپ‌گیری خودکار.
+- نیازی به نصب دستی هیچ‌چیز نیست؛ حتی باینری Redis داخل ریپو هست و اینترنت نمی‌خواهد.
+- اگر پورت اشغال باشد، خود اسکریپت آزادش می‌کند.
 
-In the dashboard you can:
-- Create proxy links (VLESS-WS, Trojan-WS, Shadowsocks)
-- View traffic stats and live connections
-- Generate QR codes for each link
-- Enable/disable links
+مرحله ۳ — صبر کن تا نصب تمام شود (حداکثر ~۲ دقیقه) و بعد سلامت را چک کن:
+curl http://127.0.0.1:3000/health
+خروجی درست باید {"status":"ok", ... , "panel_version":"9.2.3-embed"} باشد.
+(اگر پورت دیگری گذاشتی همان پورت را چک کن.)
 
-Note: VLESS-WS, Trojan-WS, and Shadowsocks work through the gateway.
-xhttp and hysteria protocols do NOT work through HTTP-only gateways.
+مرحله ۴ — ورود و بررسی نهایی:
+- آدرس پنل: http://127.0.0.1:3000/login — رمز: 123456
+- لاگین با API:
+  curl -c /tmp/rvg.c -X POST http://127.0.0.1:3000/api/login -H "Content-Type: application/json" -d '{"password":"123456"}'
+- وضعیت پنل:
+  curl -b /tmp/rvg.c http://127.0.0.1:3000/stats
+- فیلد redis_connected باید true و storage_backend باید redis باشد.
+
+قوانین حین کار:
+1. پوشه RVG/ — مخصوصاً RVG/data — را هرگز پاک نکن؛ همه داده‌ها و کلید نشست‌ها آنجاست.
+2. setup.sh را پشت‌سرهم اجرا نکن. اگر خطا دیدی اول لاگ‌ها را بخوان: RVG/launcher.log و RVG/rvg.log
+3. پنل با پایتون اجرا می‌شود (daemon.py) و نباید با bun/npm بیلد شود.
+4. بعد از ری‌استارت سرور، اگر پنل بالا نیامد: bash RVG/run-panel.sh
+5. بکاپ‌ها در RVG/backups هستند؛ بازیابی: bash RVG/restore-backup.sh --list و bash RVG/restore-backup.sh <file> --restart
+6. عیب‌یابی کامل ذخیره‌سازی/Redis (بعد از لاگین): curl -b /tmp/rvg.c http://127.0.0.1:3000/api/storage-diag
+7. ردیوس خارجی (اختیاری ولی برای محیط‌های پابلیش بهتر است): URL ردیوس را در فایل RVG/external_redis.txt بگذار؛ مثل:
+   echo 'rediss://default:PASSWORD@host:6380' > RVG/external_redis.txt
+   و بعد پنل را ری‌استارت کن. با این کار داده‌ها حتی بین دیپلوی‌های کامل هم می‌مانند.
+8. اگر /health جواب نداد: با pgrep -af daemon.py وضعیت پروسه را چک کن و در صورت نیاز bash RVG/run-panel.sh را اجرا کن.
+
+در پایان یک گزارش کوتاه بده: خروجی /health، مقدار redis_connected و storage_backend، تعداد کانفیگ‌ها (links_count)، آدرس پنل و رمز ورود.
 ```
 
 ## External Redis — bulletproof persistence for published apps
