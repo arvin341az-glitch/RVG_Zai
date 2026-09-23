@@ -27,7 +27,7 @@ def _install_packages():
 
 # _install_packages()  # deps preinstalled for local test
 
-PANEL_VERSION = "9.2.5-session"
+PANEL_VERSION = "9.2.6-vault"
 
 import asyncio
 import contextvars
@@ -165,6 +165,38 @@ DATA_FILE = DATA_DIR / "rvg_state.json"
 SECRET_FILE = DATA_DIR / ".rvg_secret"
 SAVE_LOCK = asyncio.Lock()
 
+
+def _vault_mirrors() -> list[Path]:
+    """مسیرهای «خزانه محلی» — بکاپ state در چند نقطه‌ی مستقل روی همان VM.
+    هدف: اگر RVG/data پاک شد یا فایل اصلی خراب شد، در بوت بعدی از جدیدترین
+    اسنپ‌شات سالم بازیابی شود. هیچ وابستگی به گیت‌هاب/سرویس بیرونی ندارد."""
+    extra = os.environ.get("RVG_VAULT_EXTRA_DIR", "").strip()
+    cands = [
+        DATA_DIR.parent / ".rvg_vault" / "rvg_state.json",      # کنار پوشه data (مثلاً RVG/.rvg_vault)
+        DATA_DIR.parent / "backups" / "vault" / "rvg_state.json",  # داخل پوشه بکاپ‌های خودکار
+        Path.home() / ".rvg_vault" / "rvg_state.json",          # home — مستقل از پوشه برنامه
+        Path("/var/tmp/.rvg_vault/rvg_state.json"),             # /var/tmp — در پاک‌سازی‌های /tmp زنده می‌ماند
+        Path("/tmp/.rvg_vault/rvg_state.json"),                 # /tmp — فقط ری‌استارت پروسه
+    ]
+    if extra:
+        cands.append(Path(extra) / "rvg_state.json")
+    seen: set[str] = set()
+    out: list[Path] = []
+    primary = os.path.realpath(str(DATA_FILE))
+    for c in cands:
+        try:
+            r = os.path.realpath(str(c))
+            if r == primary or r in seen:
+                continue
+            seen.add(r)
+            out.append(c)
+        except Exception:
+            continue
+    return out
+
+
+VAULT_PATHS = _vault_mirrors()
+
 # ── Redis (اختیاری) ─────────────────────────────────────────────────────────────
 # اگه REDIS_URL ست بشه و اتصال برقرار بشه، کل state پنل (کانفیگ‌ها، گروه‌های ساب،
 # رمز پنل، node ها و node key ها — یعنی همون چیزی که تا الان توی rvg_state.json
@@ -246,6 +278,33 @@ async def _write_state_file(payload: str):
     tmp.replace(DATA_FILE)
 
 
+def _vault_write_all(payload: str) -> None:
+    """نوشتن اتمیک (tmp + rename) اسنپ‌شات روی همه‌ی خزانه‌های محلی.
+    هر خزانه مستقل است؛ خطای یکی بقیه را خراب نمی‌کند."""
+    for p in VAULT_PATHS:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(str(tmp), str(p))
+        except Exception:
+            continue
+
+
+def vault_status() -> dict:
+    """برای /api/storage-diag: وضعیت هر خزانه (موجودیت + seq)."""
+    out = []
+    for p in [DATA_FILE] + list(VAULT_PATHS):
+        seq = None
+        try:
+            if p.exists():
+                seq = int(json.loads(p.read_text(encoding="utf-8")).get("seq") or 0)
+        except Exception:
+            seq = None
+        out.append({"path": str(p), "exists": bool(p.exists()), "seq": seq})
+    return {"mirrors": out}
+
+
 def _get_or_create_secret() -> str:
     env_secret = os.environ.get("SECRET_KEY")
     if env_secret:
@@ -289,6 +348,44 @@ def apply_logging_state():
         logging.disable(logging.NOTSET)
 
 
+async def _apply_state_data(data: dict) -> None:
+    """اعمال کامل یک payload state روی حافظه. برخلاف نسخه‌ی قبلی، secret و
+    sessions را هم اعمال می‌کند (قبلاً در مسیر فایل/Redis اعمال نمی‌شدند و
+    بعد از هر ری‌استارت همه کاربران لاگ‌اوت می‌شدند). sessions ادغام
+    می‌شوند نه جایگزین، و نشست‌های منقضی حذف می‌شوند."""
+    global STATE_SEQ
+    if not isinstance(data, dict):
+        return
+    LINKS.update(data.get("links", {}))
+    SUBS.update(data.get("subs", {}))
+    NODE_KEYS.update(data.get("node_keys", {}))
+    for nid, n in (data.get("nodes") or {}).items():
+        NODES[nid] = _normalize_node(n)
+    if data.get("password_hash"):
+        AUTH["password_hash"] = data["password_hash"]
+    if data.get("password_hash_v2"):
+        AUTH["password_hash_v2"] = data["password_hash_v2"]
+    CONFIG["disable_logging"] = bool(data.get("disable_logging", False))
+    if data.get("secret"):
+        CONFIG["secret"] = str(data["secret"])
+    try:
+        now = time.time()
+        merged = {t: e for t, e in SESSIONS.items() if e > now}
+        for t, e in (data.get("sessions") or {}).items():
+            if isinstance(e, (int, float)) and e > now:
+                merged[str(t)] = e
+        async with SESSIONS_LOCK:
+            SESSIONS.clear()
+            SESSIONS.update(merged)
+    except Exception:
+        pass
+    apply_logging_state()
+    try:
+        STATE_SEQ = max(STATE_SEQ, int(data.get("seq") or 0))
+    except Exception:
+        pass
+
+
 async def load_state():
     global LINKS, AUTH, SUBS, STATE_SEQ
     data = None
@@ -308,12 +405,16 @@ async def load_state():
             if DATA_FILE.exists():
                 async with aiofiles.open(DATA_FILE, "r", encoding="utf-8") as f:
                     raw = await f.read()
-                data = json.loads(raw)
-                loaded_from = "file"
+                try:
+                    data = json.loads(raw)
+                    loaded_from = "file"
+                except Exception as e:
+                    logger.warning(f"فایل state خراب است ({e}) — خزانه محلی چک می‌شود.")
+                    data = None
                 # اولین باری که Redis وصل شده ولی هنوز چیزی داخلش نیست، دیتای
                 # فایل محلی (قبلی) رو یک‌بار به Redis منتقل می‌کنیم تا از این
                 # به بعد Redis منبع اصلی باشه.
-                if REDIS_CONNECTED and redis_client:
+                if data and REDIS_CONNECTED and redis_client:
                     try:
                         await redis_client.set(REDIS_STATE_KEY, json.dumps(data, ensure_ascii=False))
                         logger.info("state موجود روی فایل محلی، یک‌بار به Redis منتقل شد.")
@@ -321,21 +422,7 @@ async def load_state():
                         logger.warning(f"انتقال state به Redis ناموفق بود: {e}")
 
         if data:
-            LINKS.update(data.get("links", {}))
-            SUBS.update(data.get("subs", {}))
-            NODE_KEYS.update(data.get("node_keys", {}))
-            for nid, n in (data.get("nodes") or {}).items():
-                NODES[nid] = _normalize_node(n)
-            if "password_hash" in data:
-                AUTH["password_hash"] = data["password_hash"]
-            if "password_hash_v2" in data:
-                AUTH["password_hash_v2"] = data["password_hash_v2"]
-            CONFIG["disable_logging"] = bool(data.get("disable_logging", False))
-            apply_logging_state()
-            try:
-                STATE_SEQ = max(STATE_SEQ, int(data.get("seq") or 0))
-            except Exception:
-                pass
+            await _apply_state_data(data)
             logger.info(
                 f"State loaded from {loaded_from}: {len(LINKS)} links, {len(SUBS)} subs, "
                 f"{len(NODES)} nodes, {len(NODE_KEYS)} node keys (seq={STATE_SEQ})"
@@ -385,12 +472,48 @@ async def save_state(bump: bool = True):
         try:
             # وقتی Redis وصله هم به‌عنوان پشتیبان محلی نوشته می‌شه (هزینه‌ش
             # ناچیزه)، ولی وقتی Redis وصل نیست، همین فایل تنها منبع دیتاست.
-            await _write_state_file(json.dumps(data, ensure_ascii=False, indent=2))
+            payload_str = json.dumps(data, ensure_ascii=False, indent=2)
+            await _write_state_file(payload_str)
+            # خزانه محلی: همین اسنپ‌شات روی چند مسیر مستقل دیگر هم می‌رود
+            # (اتمیک، داخل SAVE_LOCK تا ترتیب نسخه‌ها حفظ شود).
+            try:
+                await asyncio.to_thread(_vault_write_all, payload_str)
+            except Exception:
+                pass
         except Exception as e:
             if not wrote_to_redis:
                 logger.warning(f"Could not save state: {e}")
     if REMOTE["enabled"]:
         schedule_remote_push()
+
+
+async def _vault_boot_recovery() -> bool:
+    """در بوت: بین فایل اصلی + همه‌ی خزانه‌ها، جدیدترین اسنپ‌شات سالم
+    (بیشترین seq) را پیدا کن؛ اگر از state فعلی جدیدتر بود همان را adopt کن
+    و روی همه‌ی منابع (Redis/فایل/خزانه‌ها) بازنویسی کن."""
+    best = None
+    best_seq = STATE_SEQ
+    best_src = None
+    for p in [DATA_FILE] + list(VAULT_PATHS):
+        try:
+            if not p.exists():
+                continue
+            raw = await asyncio.to_thread(p.read_text, "utf-8")
+            d = json.loads(raw)
+            s = int(d.get("seq") or 0)
+            if s > best_seq:
+                best, best_seq, best_src = d, s, p
+        except Exception:
+            continue
+    if best:
+        logger.info(
+            f"Vault recovery: {best_src} (seq={best_seq}) جدیدتر از state فعلی "
+            f"(seq={STATE_SEQ}) است → بازیابی از خزانه محلی"
+        )
+        await _apply_state_data(best)
+        await save_state(bump=False)
+        return True
+    return False
 
 
 # ── Debounced save ─────────────────────────────────────────────────────────────
@@ -831,6 +954,10 @@ async def startup():
         asyncio.create_task(redis_watchdog())
     await load_state()
     await _load_sessions()
+    try:
+        await asyncio.wait_for(_vault_boot_recovery(), timeout=20.0)
+    except Exception as e:
+        logger.warning(f"vault boot recovery skipped/failed: {e}")
     if REMOTE["enabled"]:
         try:
             await asyncio.wait_for(remote_boot_sync(), timeout=30.0)

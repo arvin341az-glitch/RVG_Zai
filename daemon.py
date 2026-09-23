@@ -477,6 +477,12 @@ def add_config_endpoints(main_mod, app):
             }
         except Exception:
             pass
+        try:
+            vstat = getattr(main_mod, "vault_status", None)
+            if callable(vstat):
+                diag["vault"] = vstat()
+        except Exception:
+            pass
 
         try:
             entries = sorted(e.name + ("/" if e.is_dir() else "")
